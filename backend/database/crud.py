@@ -1,0 +1,898 @@
+"""Thao tác CRUD SQLite: Người dùng (RBAC), 64 thực phẩm chuẩn, Món ăn, Phiếu chuẩn bị & Nhật ký."""
+
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from ai_engine.nutrition_mapper import NUTRITION_TABLE_64, normalize_label
+from backend.core.security import ROLE_ADMIN, ROLE_CHEF, ROLE_RECEIVER, hash_password
+from backend.database.models import SCHEMA_SQL, get_db_conn
+
+logger = logging.getLogger("nutrition_station.database.crud")
+
+# Bộ 14 món ăn mẫu cho bếp ăn tập thể — 100% nguyên liệu thuộc 64 classes YOLO26n
+SEED_DISHES: list[dict[str, Any]] = [
+    {
+        "code": "DISH_FISH_PASSION",
+        "name_vi": "Cá phi lê áp chảo sốt chanh leo",
+        "category": "Món mặn chính",
+        "description": "Cá phi lê giàu đạm kết hợp măng tây và sốt chanh leo tươi.",
+        "ingredients": [("Fish", 150.0), ("Passion Fruit", 35.0), ("Asparagus", 60.0), ("Lemon", 10.0)],
+    },
+    {
+        "code": "DISH_BEEF_CAULIFLOWER",
+        "name_vi": "Thịt bò xào súp lơ & ớt chuông",
+        "category": "Món mặn chính",
+        "description": "Thịt bò nạc xào súp lơ trắng, ớt chuông giòn ngọt.",
+        "ingredients": [("Beef", 130.0), ("Cauliflower", 100.0), ("Bell Pepper", 50.0), ("Garlic", 8.0)],
+    },
+    {
+        "code": "DISH_CHICKEN_CABBAGE",
+        "name_vi": "Thịt gà luộc xé phay gỏi bắp cải",
+        "category": "Món mặn chính",
+        "description": "Thịt gà luộc trộn bắp cải trắng, cà rốt và chanh tươi.",
+        "ingredients": [("Chicken", 160.0), ("Cabbage", 90.0), ("Carrot", 40.0), ("Lime", 15.0)],
+    },
+    {
+        "code": "DISH_SHRIMP_ZUCCHINI_SOUP",
+        "name_vi": "Canh bí ngòi nấu tôm tươi",
+        "category": "Món canh",
+        "description": "Canh thanh mát từ bí ngòi xanh, tôm tươi và cà chua.",
+        "ingredients": [("Zucchini", 120.0), ("Shrimp", 80.0), ("Tomato", 40.0), ("Red Onion", 10.0)],
+    },
+    {
+        "code": "DISH_SALAD_TOMATO_EGG",
+        "name_vi": "Salad cà chua dưa chuột trứng gà",
+        "category": "Món rau / Salad",
+        "description": "Salad thanh đạm cung cấp vitamin C và đạm từ trứng gà.",
+        "ingredients": [("Tomato", 90.0), ("Cucumber", 90.0), ("Egg", 60.0), ("White Onion", 20.0)],
+    },
+    {
+        "code": "DISH_PORK_BRAISED_EGG",
+        "name_vi": "Thịt heo kho trứng & cà rốt",
+        "category": "Món mặn chính",
+        "description": "Thịt lợn nạc kho trứng gà cùng cà rốt củ.",
+        "ingredients": [("Pork", 140.0), ("Egg", 60.0), ("Carrot", 60.0), ("Garlic", 8.0)],
+    },
+    {
+        "code": "DISH_BEEF_POTATO_STEW",
+        "name_vi": "Bò hầm khoai tây cà rốt",
+        "category": "Món mặn chính",
+        "description": "Món hầm giàu năng lượng cho ca làm việc nặng.",
+        "ingredients": [("Beef", 130.0), ("Potato", 120.0), ("Carrot", 70.0), ("Tomato", 50.0)],
+    },
+    {
+        "code": "DISH_CHICKEN_MUSHROOM",
+        "name_vi": "Gà xào nấm tươi & đậu cô ve",
+        "category": "Món mặn chính",
+        "description": "Thịt gà xào nấm và đậu cô ve giữ độ giòn tự nhiên.",
+        "ingredients": [("Chicken", 140.0), ("Mushroom", 70.0), ("Green Beans", 80.0), ("Ginger", 8.0)],
+    },
+    {
+        "code": "DISH_STEAMED_FISH_GINGER",
+        "name_vi": "Cá hấp gừng hành tây & cà chua",
+        "category": "Món mặn chính",
+        "description": "Cá hấp giữ trọn dưỡng chất, ít chất béo bão hòa.",
+        "ingredients": [("Fish", 160.0), ("Ginger", 15.0), ("White Onion", 40.0), ("Tomato", 60.0)],
+    },
+    {
+        "code": "DISH_CRAB_CORN_SOUP",
+        "name_vi": "Cua biển nấu bắp ngọt & bí ngòi",
+        "category": "Món canh",
+        "description": "Món canh hải sản giàu canxi và kẽm.",
+        "ingredients": [("Crab", 150.0), ("Corn", 80.0), ("Zucchini", 70.0), ("Lemon", 15.0)],
+    },
+    {
+        "code": "DISH_PORK_EGGPLANT",
+        "name_vi": "Thịt heo xào cà tím & ớt chuông",
+        "category": "Món mặn chính",
+        "description": "Thịt lợn nạc xào cà tím và ớt chuông Đà Lạt.",
+        "ingredients": [("Pork", 120.0), ("Eggplant", 100.0), ("Bell Pepper", 50.0), ("Garlic", 8.0)],
+    },
+    {
+        "code": "DISH_LAMB_SWEET_POTATO",
+        "name_vi": "Thịt cừu nướng khoai lang & măng tây",
+        "category": "Món mặn cao cấp",
+        "description": "Bữa ăn giàu đạm và tinh bột chậm từ khoai lang.",
+        "ingredients": [("Lamb", 130.0), ("Sweet Potato", 130.0), ("Asparagus", 60.0)],
+    },
+    {
+        "code": "DISH_TROPICAL_FRUIT",
+        "name_vi": "Tráng miệng trái cây tươi (Dưa hấu, Xoài, Thanh long)",
+        "category": "Tráng miệng",
+        "description": "Đĩa trái cây tươi bổ sung vitamin tự nhiên sau bữa.",
+        "ingredients": [("Watermelon", 120.0), ("Mango", 80.0), ("Dragon Fruit", 80.0)],
+    },
+    {
+        "code": "DISH_AVOCADO_BANANA_CASHEW",
+        "name_vi": "Sinh tố bơ chuối & hạt điều",
+        "category": "Tráng miệng / Bữa phụ",
+        "description": "Bữa phụ giàu chất béo tốt và năng lượng.",
+        "ingredients": [("Avocado", 80.0), ("Banana", 90.0), ("Cashew Nut", 20.0)],
+    },
+]
+
+SEED_USERS: list[tuple[str, str, str, str]] = [
+    ("admin", "admin123", "Nguyễn Văn Quản Lý", ROLE_ADMIN),
+    ("chef", "chef123", "Trần Minh Đầu Bếp", ROLE_CHEF),
+    ("receiver", "receiver123", "Lê Thị Kiểm Định", ROLE_RECEIVER),
+]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def local_today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _ensure_migrations(conn: Any) -> None:
+    """Bổ sung cột mới vào bảng cũ nếu database đã tồn tại từ phiên bản trước."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(intake_logs)").fetchall()}
+    if "order_id" not in cols:
+        conn.execute("ALTER TABLE intake_logs ADD COLUMN order_id TEXT DEFAULT ''")
+    if "order_item_id" not in cols:
+        conn.execute("ALTER TABLE intake_logs ADD COLUMN order_item_id TEXT DEFAULT ''")
+
+
+def init_database() -> None:
+    """Khởi tạo toàn bộ bảng SQLite, seed 64 thực phẩm, 3 tài khoản mẫu và 14 món ăn bếp tập thể."""
+    now = utc_now_iso()
+    with get_db_conn() as conn:
+        conn.executescript(SCHEMA_SQL)
+        _ensure_migrations(conn)
+
+        # 1. Seed 64 loại thực phẩm chuẩn YOLO26n
+        for profile in NUTRITION_TABLE_64.values():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO foods_nutrition (
+                    code, class_name, vietnamese_name, food_group,
+                    edible_portion_percent, energy_kcal, protein_g, fat_g,
+                    carbohydrate_g, fiber_g, calcium_mg, iron_mg, vitamin_c_mg,
+                    source, is_active, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    profile.code,
+                    profile.class_name,
+                    profile.vietnamese_name,
+                    profile.food_group,
+                    profile.edible_portion_percent,
+                    profile.energy_kcal,
+                    profile.protein_g,
+                    profile.fat_g,
+                    profile.carbohydrate_g,
+                    profile.fiber_g,
+                    profile.calcium_mg,
+                    profile.iron_mg,
+                    profile.vitamin_c_mg,
+                    profile.source,
+                    now,
+                ),
+            )
+
+        # 2. Seed 3 tài khoản demo RBAC
+        for uname, raw_pw, fname, role in SEED_USERS:
+            existing = conn.execute("SELECT id FROM users WHERE username = ?", (uname,)).fetchone()
+            if not existing:
+                conn.execute(
+                    """
+                    INSERT INTO users (username, password_hash, full_name, role, is_active, created_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    """,
+                    (uname, hash_password(raw_pw), fname, role, now),
+                )
+
+        # 3. Seed 14 món ăn chuẩn (chỉ thêm nếu chưa có)
+        for dish in SEED_DISHES:
+            existing_dish = conn.execute("SELECT id FROM dishes WHERE code = ?", (dish["code"],)).fetchone()
+            if existing_dish:
+                continue
+            cur = conn.execute(
+                """
+                INSERT INTO dishes (code, name_vi, category, description, is_active, created_by, updated_at)
+                VALUES (?, ?, ?, ?, 1, 'system', ?)
+                """,
+                (dish["code"], dish["name_vi"], dish["category"], dish["description"], now),
+            )
+            dish_id = cur.lastrowid
+            for cls_name, grams in dish["ingredients"]:
+                conn.execute(
+                    """
+                    INSERT INTO dish_ingredients (dish_id, class_name, grams_per_serving)
+                    VALUES (?, ?, ?)
+                    """,
+                    (dish_id, cls_name, grams),
+                )
+
+    logger.info("[DB] Đã khởi tạo SQLite Enterprise (Users, 64 Foods, 14 Dishes, Procurement, Logs).")
+
+
+# ==============================================================================
+# USER & RBAC CRUD
+# ==============================================================================
+
+def _row_to_user(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "full_name": row["full_name"],
+        "role": row["role"],
+        "is_active": bool(row["is_active"]),
+        "created_at": row["created_at"],
+    }
+
+
+def get_user_by_username(username: str) -> dict[str, Any] | None:
+    with get_db_conn() as conn:
+        row = conn.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username.strip(),)).fetchone()
+    return dict(row) if row else None
+
+
+def list_users() -> list[dict[str, Any]]:
+    with get_db_conn() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
+    return [_row_to_user(r) for r in rows]
+
+
+def create_user(username: str, password: str, full_name: str, role: str) -> dict[str, Any]:
+    now = utc_now_iso()
+    with get_db_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO users (username, password_hash, full_name, role, is_active, created_at)
+            VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (username.strip().lower(), hash_password(password), full_name.strip(), role.upper(), now),
+        )
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_user(row)
+
+
+def update_user(user_id: int, fields: dict[str, Any]) -> dict[str, Any] | None:
+    updates: dict[str, Any] = {}
+    if "full_name" in fields and fields["full_name"] is not None:
+        updates["full_name"] = str(fields["full_name"]).strip()
+    if "role" in fields and fields["role"] is not None:
+        updates["role"] = str(fields["role"]).upper()
+    if "is_active" in fields and fields["is_active"] is not None:
+        updates["is_active"] = 1 if fields["is_active"] else 0
+    if "password" in fields and fields["password"]:
+        updates["password_hash"] = hash_password(str(fields["password"]))
+
+    with get_db_conn() as conn:
+        if updates:
+            assignments = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(f"UPDATE users SET {assignments} WHERE id = ?", list(updates.values()) + [user_id])
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return _row_to_user(row) if row else None
+
+
+def delete_user(user_id: int) -> bool:
+    with get_db_conn() as conn:
+        cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return cur.rowcount > 0
+
+
+# ==============================================================================
+# FOODS NUTRITION (64 CLASSES)
+# ==============================================================================
+
+def _row_to_food(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "code": row["code"],
+        "class_name": row["class_name"],
+        "vietnamese_name": row["vietnamese_name"],
+        "food_group": row["food_group"],
+        "edible_portion_percent": row["edible_portion_percent"],
+        "energy_kcal": row["energy_kcal"],
+        "protein_g": row["protein_g"],
+        "fat_g": row["fat_g"],
+        "carbohydrate_g": row["carbohydrate_g"],
+        "fiber_g": row["fiber_g"],
+        "calcium_mg": row["calcium_mg"],
+        "iron_mg": row["iron_mg"],
+        "vitamin_c_mg": row["vitamin_c_mg"],
+        "source": row["source"],
+        "is_active": bool(row["is_active"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_foods(search: str | None = None, food_group: str | None = None) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM foods_nutrition WHERE 1=1"
+    params: list[Any] = []
+    if search:
+        sql += " AND (LOWER(class_name) LIKE ? OR LOWER(vietnamese_name) LIKE ? OR LOWER(code) LIKE ?)"
+        q = f"%{search.strip().lower()}%"
+        params.extend([q, q, q])
+    if food_group:
+        sql += " AND food_group = ?"
+        params.append(food_group.strip())
+    sql += " ORDER BY vietnamese_name ASC"
+
+    with get_db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [_row_to_food(r) for r in rows]
+
+
+def get_food_by_label(label: str) -> dict[str, Any] | None:
+    clean = normalize_label(label)
+    if not clean or clean == "Unknown":
+        return None
+    with get_db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM foods_nutrition
+            WHERE LOWER(class_name) = LOWER(?)
+               OR LOWER(code) = LOWER(?)
+               OR LOWER(vietnamese_name) = LOWER(?)
+            LIMIT 1
+            """,
+            (clean, clean.replace(" ", "_"), clean),
+        ).fetchone()
+    return _row_to_food(row) if row else None
+
+
+def update_food_nutrition(food_id: int, fields: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {
+        "vietnamese_name", "food_group", "edible_portion_percent",
+        "energy_kcal", "protein_g", "fat_g", "carbohydrate_g",
+        "fiber_g", "calcium_mg", "iron_mg", "vitamin_c_mg", "is_active",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    with get_db_conn() as conn:
+        if updates:
+            if "is_active" in updates:
+                updates["is_active"] = 1 if updates["is_active"] else 0
+            updates["updated_at"] = utc_now_iso()
+            assignments = ", ".join(f"{k} = ?" for k in updates)
+            conn.execute(f"UPDATE foods_nutrition SET {assignments} WHERE id = ?", list(updates.values()) + [food_id])
+        row = conn.execute("SELECT * FROM foods_nutrition WHERE id = ?", (food_id,)).fetchone()
+    return _row_to_food(row) if row else None
+
+
+# ==============================================================================
+# DISHES & RECIPES (STRICTLY 64 DATASET INGREDIENTS)
+# ==============================================================================
+
+def _hydrate_dish(conn: Any, dish_row: Any) -> dict[str, Any]:
+    ing_rows = conn.execute(
+        """
+        SELECT di.id, di.class_name, di.grams_per_serving,
+               fn.vietnamese_name, fn.food_group, fn.edible_portion_percent,
+               fn.energy_kcal, fn.protein_g, fn.fat_g, fn.carbohydrate_g, fn.fiber_g
+        FROM dish_ingredients di
+        JOIN foods_nutrition fn ON fn.class_name = di.class_name
+        WHERE di.dish_id = ?
+        ORDER BY di.id ASC
+        """,
+        (dish_row["id"],),
+    ).fetchall()
+
+    total_kcal = 0.0
+    total_protein = 0.0
+    total_fat = 0.0
+    total_carb = 0.0
+    total_grams = 0.0
+    ingredients: list[dict[str, Any]] = []
+
+    for r in ing_rows:
+        g = float(r["grams_per_serving"])
+        edible_g = g * (float(r["edible_portion_percent"]) / 100.0)
+        factor = edible_g / 100.0
+        kcal = round(float(r["energy_kcal"]) * factor, 1)
+        prot = round(float(r["protein_g"]) * factor, 2)
+        fat = round(float(r["fat_g"]) * factor, 2)
+        carb = round(float(r["carbohydrate_g"]) * factor, 2)
+
+        total_grams += g
+        total_kcal += kcal
+        total_protein += prot
+        total_fat += fat
+        total_carb += carb
+
+        ingredients.append({
+            "id": r["id"],
+            "class_name": r["class_name"],
+            "vietnamese_name": r["vietnamese_name"],
+            "food_group": r["food_group"],
+            "grams_per_serving": g,
+            "edible_portion_percent": r["edible_portion_percent"],
+            "kcal_per_serving": kcal,
+            "protein_per_serving": prot,
+            "fat_per_serving": fat,
+            "carb_per_serving": carb,
+        })
+
+    return {
+        "id": dish_row["id"],
+        "code": dish_row["code"],
+        "name_vi": dish_row["name_vi"],
+        "category": dish_row["category"],
+        "description": dish_row["description"],
+        "is_active": bool(dish_row["is_active"]),
+        "created_by": dish_row["created_by"],
+        "updated_at": dish_row["updated_at"],
+        "ingredients": ingredients,
+        "per_serving": {
+            "total_grams": round(total_grams, 1),
+            "energy_kcal": round(total_kcal, 1),
+            "protein_g": round(total_protein, 1),
+            "fat_g": round(total_fat, 1),
+            "carbohydrate_g": round(total_carb, 1),
+        },
+    }
+
+
+def list_dishes(search: str | None = None, category: str | None = None) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM dishes WHERE is_active = 1"
+    params: list[Any] = []
+    if search:
+        sql += " AND (LOWER(name_vi) LIKE ? OR LOWER(code) LIKE ?)"
+        q = f"%{search.strip().lower()}%"
+        params.extend([q, q])
+    if category:
+        sql += " AND category = ?"
+        params.append(category.strip())
+    sql += " ORDER BY id DESC"
+
+    with get_db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        return [_hydrate_dish(conn, r) for r in rows]
+
+
+def get_dish_by_id(dish_id: int) -> dict[str, Any] | None:
+    with get_db_conn() as conn:
+        row = conn.execute("SELECT * FROM dishes WHERE id = ?", (dish_id,)).fetchone()
+        return _hydrate_dish(conn, row) if row else None
+
+
+def create_dish(
+    name_vi: str,
+    category: str,
+    description: str,
+    ingredients: list[dict[str, Any]],
+    created_by: str = "chef",
+) -> dict[str, Any]:
+    """Tạo mới món ăn từ danh sách 64 nguyên liệu chuẩn."""
+    if not ingredients:
+        raise ValueError("Món ăn phải có ít nhất 1 nguyên liệu từ danh sách 64 loại chuẩn.")
+
+    now = utc_now_iso()
+    code = f"DISH_{uuid.uuid4().hex[:8].upper()}"
+    with get_db_conn() as conn:
+        # Kiểm tra 100% nguyên liệu thuộc bảng 64 lớp
+        for ing in ingredients:
+            cls_name = str(ing.get("class_name", "")).strip()
+            exists = conn.execute(
+                "SELECT class_name FROM foods_nutrition WHERE LOWER(class_name) = LOWER(?)",
+                (cls_name,),
+            ).fetchone()
+            if not exists:
+                raise ValueError(f"Nguyên liệu '{cls_name}' không nằm trong 64 lớp YOLO26n chuẩn.")
+
+        cur = conn.execute(
+            """
+            INSERT INTO dishes (code, name_vi, category, description, is_active, created_by, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+            """,
+            (code, name_vi.strip(), category.strip(), description.strip(), created_by, now),
+        )
+        dish_id = cur.lastrowid
+        for ing in ingredients:
+            cls_name = str(ing["class_name"]).strip()
+            row_fn = conn.execute(
+                "SELECT class_name FROM foods_nutrition WHERE LOWER(class_name) = LOWER(?)",
+                (cls_name,),
+            ).fetchone()
+            grams = float(ing["grams_per_serving"])
+            if grams <= 0:
+                raise ValueError("Định lượng mỗi suất phải lớn hơn 0g.")
+            conn.execute(
+                "INSERT INTO dish_ingredients (dish_id, class_name, grams_per_serving) VALUES (?, ?, ?)",
+                (dish_id, row_fn["class_name"], grams),
+            )
+        row = conn.execute("SELECT * FROM dishes WHERE id = ?", (dish_id,)).fetchone()
+        return _hydrate_dish(conn, row)
+
+
+def delete_dish(dish_id: int) -> bool:
+    with get_db_conn() as conn:
+        cur = conn.execute("UPDATE dishes SET is_active = 0 WHERE id = ?", (dish_id,))
+        return cur.rowcount > 0
+
+
+# ==============================================================================
+# PROCUREMENT ORDERS & CHECKLIST (PHIẾU YÊU CẦU NGUYÊN LIỆU)
+# ==============================================================================
+
+def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
+    items = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM procurement_items WHERE order_id = ? ORDER BY required_gram DESC",
+            (order_row["id"],),
+        ).fetchall()
+    ]
+    total_items = len(items)
+    completed_items = sum(1 for it in items if it["status"] == "COMPLETED")
+    return {
+        "id": order_row["id"],
+        "order_code": order_row["order_code"],
+        "title": order_row["title"],
+        "meal_date": order_row["meal_date"],
+        "meal_shift": order_row["meal_shift"],
+        "servings": order_row["servings"],
+        "dishes": json.loads(order_row["dishes_json"]),
+        "total_kcal": order_row["total_kcal"],
+        "total_protein_g": order_row["total_protein_g"],
+        "total_fat_g": order_row["total_fat_g"],
+        "total_carb_g": order_row["total_carb_g"],
+        "status": order_row["status"],
+        "created_by": order_row["created_by"],
+        "created_at": order_row["created_at"],
+        "completed_at": order_row["completed_at"],
+        "note": order_row["note"],
+        "progress": {
+            "completed": completed_items,
+            "total": total_items,
+            "percent": round((completed_items / total_items) * 100.0, 1) if total_items else 0.0,
+        },
+        "items": items,
+    }
+
+
+def create_procurement_order(
+    title: str,
+    meal_date: str,
+    meal_shift: str,
+    servings: int,
+    dish_ids: list[int],
+    created_by: str,
+    note: str = "",
+    tolerance_percent: float = 5.0,
+) -> dict[str, Any]:
+    """Lập kế hoạch bữa ăn -> Tính tổng Calo/Macro -> Sinh Phiếu yêu cầu nguyên liệu đẩy xuống trạm cân."""
+    if servings <= 0:
+        raise ValueError("Số lượng suất ăn phải lớn hơn 0.")
+    if not dish_ids:
+        raise ValueError("Vui lòng chọn ít nhất 1 món ăn cho thực đơn.")
+
+    order_id = f"ord_{uuid.uuid4().hex[:10]}"
+    order_code = f"PO-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    now = utc_now_iso()
+
+    with get_db_conn() as conn:
+        aggregated_ingredients: dict[str, dict[str, Any]] = {}
+        selected_dishes: list[dict[str, Any]] = []
+        total_kcal = 0.0
+        total_protein = 0.0
+        total_fat = 0.0
+        total_carb = 0.0
+
+        for did in dish_ids:
+            dish_row = conn.execute("SELECT * FROM dishes WHERE id = ? AND is_active = 1", (did,)).fetchone()
+            if not dish_row:
+                raise ValueError(f"Không tìm thấy món ăn ID={did}.")
+            dish_data = _hydrate_dish(conn, dish_row)
+            selected_dishes.append({
+                "id": dish_data["id"],
+                "name_vi": dish_data["name_vi"],
+                "category": dish_data["category"],
+                "kcal_per_serving": dish_data["per_serving"]["energy_kcal"],
+            })
+            total_kcal += dish_data["per_serving"]["energy_kcal"] * servings
+            total_protein += dish_data["per_serving"]["protein_g"] * servings
+            total_fat += dish_data["per_serving"]["fat_g"] * servings
+            total_carb += dish_data["per_serving"]["carbohydrate_g"] * servings
+
+            for ing in dish_data["ingredients"]:
+                cls_name = ing["class_name"]
+                req_g = round(float(ing["grams_per_serving"]) * servings, 1)
+                if cls_name not in aggregated_ingredients:
+                    aggregated_ingredients[cls_name] = {
+                        "class_name": cls_name,
+                        "food_name_vi": ing["vietnamese_name"],
+                        "food_group": ing["food_group"],
+                        "required_gram": req_g,
+                    }
+                else:
+                    aggregated_ingredients[cls_name]["required_gram"] = round(
+                        aggregated_ingredients[cls_name]["required_gram"] + req_g, 1
+                    )
+
+        conn.execute(
+            """
+            INSERT INTO procurement_orders (
+                id, order_code, title, meal_date, meal_shift, servings, dishes_json,
+                total_kcal, total_protein_g, total_fat_g, total_carb_g,
+                status, created_by, created_at, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+            """,
+            (
+                order_id, order_code, title.strip(), meal_date, meal_shift, servings,
+                json.dumps(selected_dishes, ensure_ascii=False),
+                round(total_kcal, 1), round(total_protein, 1), round(total_fat, 1), round(total_carb, 1),
+                created_by, now, note.strip(),
+            ),
+        )
+
+        for item in aggregated_ingredients.values():
+            req = item["required_gram"]
+            min_acc = round(req * (1.0 - tolerance_percent / 100.0), 1)
+            item_id = f"poi_{uuid.uuid4().hex[:10]}"
+            conn.execute(
+                """
+                INSERT INTO procurement_items (
+                    id, order_id, class_name, food_name_vi, food_group,
+                    required_gram, tolerance_percent, min_acceptable_gram, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                """,
+                (
+                    item_id, order_id, item["class_name"], item["food_name_vi"],
+                    item["food_group"], req, tolerance_percent, min_acc,
+                ),
+            )
+
+        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        return _hydrate_order(conn, order_row)
+
+
+def list_procurement_orders(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM procurement_orders WHERE 1=1"
+    params: list[Any] = []
+    if status:
+        sql += " AND status = ?"
+        params.append(status.upper())
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with get_db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        return [_hydrate_order(conn, r) for r in rows]
+
+
+def get_procurement_order(order_id: str) -> dict[str, Any] | None:
+    with get_db_conn() as conn:
+        row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        return _hydrate_order(conn, row) if row else None
+
+
+def mark_procurement_item_completed(
+    order_id: str,
+    item_id: str,
+    actual_gram: float,
+    quality_status: str,
+    confidence: float,
+    checked_by: str,
+    log_id: str,
+    image_url: str | None = None,
+) -> dict[str, Any]:
+    """Đánh dấu TÍCH XANH nguyên liệu trong phiếu và tự động hoàn tất đơn hàng khi đủ 100%."""
+    now = utc_now_iso()
+    with get_db_conn() as conn:
+        item_row = conn.execute(
+            "SELECT * FROM procurement_items WHERE id = ? AND order_id = ?",
+            (item_id, order_id),
+        ).fetchone()
+        if not item_row:
+            raise ValueError("Không tìm thấy dòng nguyên liệu trong phiếu yêu cầu.")
+
+        conn.execute(
+            """
+            UPDATE procurement_items
+            SET actual_gram = ?, quality_status = ?, confidence = ?,
+                status = 'COMPLETED', checked_by = ?, checked_at = ?,
+                log_id = ?, image_url = ?
+            WHERE id = ?
+            """,
+            (
+                round(actual_gram, 1), quality_status, round(confidence, 3),
+                checked_by, now, log_id, image_url or "", item_id,
+            ),
+        )
+
+        # Kiểm tra nếu tất cả nguyên liệu trong phiếu đã COMPLETED -> chuyển đơn sang COMPLETED
+        pending = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM procurement_items WHERE order_id = ? AND status != 'COMPLETED'",
+            (order_id,),
+        ).fetchone()["cnt"]
+
+        if pending == 0:
+            conn.execute(
+                "UPDATE procurement_orders SET status = 'COMPLETED', completed_at = ? WHERE id = ?",
+                (now, order_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE procurement_orders SET status = 'IN_PROGRESS' WHERE id = ? AND status = 'PENDING'",
+                (order_id,),
+            )
+
+        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        return _hydrate_order(conn, order_row)
+
+
+# ==============================================================================
+# INTAKE LOGS & DAILY ANALYTICS
+# ==============================================================================
+
+def insert_intake_log(doc: dict[str, Any]) -> dict[str, Any]:
+    local_date = doc.get("local_date") or local_today_str()
+    with get_db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO intake_logs (
+                id, batch_code, timestamp, local_date, station_id,
+                class_name, food_name_vi, food_group,
+                weight_gram, edible_gram, quality_status, confidence,
+                inference_time_ms, strategy,
+                energy_kcal, protein_g, fat_g, carbohydrate_g, fiber_g,
+                calcium_mg, iron_mg, vitamin_c_mg,
+                image_url, note, confirmed_by, order_id, order_item_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                doc["id"], doc["batch_code"], doc["timestamp"], local_date, doc["station_id"],
+                doc["class_name"], doc["food_name_vi"], doc["food_group"],
+                doc["weight_gram"], doc["edible_gram"], doc["quality_status"], doc["confidence"],
+                doc["inference_time_ms"], doc["strategy"],
+                doc["energy_kcal"], doc["protein_g"], doc["fat_g"], doc["carbohydrate_g"], doc["fiber_g"],
+                doc["calcium_mg"], doc["iron_mg"], doc["vitamin_c_mg"],
+                doc.get("image_url"), doc.get("note", ""), doc.get("confirmed_by", "Trạm cân AI"),
+                doc.get("order_id", ""), doc.get("order_item_id", ""),
+            ),
+        )
+
+        is_accepted = doc["quality_status"] != "REJECTED"
+        row = conn.execute("SELECT * FROM daily_nutrition_analytics WHERE date = ?", (local_date,)).fetchone()
+
+        w_kg = round(doc["weight_gram"] / 1000.0, 4)
+        acc_kg = w_kg if is_accepted else 0.0
+        add_kcal = doc["energy_kcal"] if is_accepted else 0.0
+        add_p = doc["protein_g"] if is_accepted else 0.0
+        add_f = doc["fat_g"] if is_accepted else 0.0
+        add_c = doc["carbohydrate_g"] if is_accepted else 0.0
+        add_fib = doc["fiber_g"] if is_accepted else 0.0
+
+        fresh_inc = 1 if doc["quality_status"] == "FRESH" else 0
+        warn_inc = 1 if doc["quality_status"] == "WARNING" else 0
+        rej_inc = 1 if doc["quality_status"] == "REJECTED" else 0
+
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO daily_nutrition_analytics (
+                    date, total_batches, fresh_count, warning_count, rejected_count,
+                    total_weight_kg, accepted_weight_kg, total_kcal,
+                    total_protein_g, total_fat_g, total_carb_g, total_fiber_g
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    local_date, fresh_inc, warn_inc, rej_inc,
+                    w_kg, acc_kg, round(add_kcal, 1),
+                    round(add_p, 1), round(add_f, 1), round(add_c, 1), round(add_fib, 1),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE daily_nutrition_analytics
+                SET total_batches = total_batches + 1,
+                    fresh_count = fresh_count + ?,
+                    warning_count = warning_count + ?,
+                    rejected_count = rejected_count + ?,
+                    total_weight_kg = ROUND(total_weight_kg + ?, 3),
+                    accepted_weight_kg = ROUND(accepted_weight_kg + ?, 3),
+                    total_kcal = ROUND(total_kcal + ?, 1),
+                    total_protein_g = ROUND(total_protein_g + ?, 1),
+                    total_fat_g = ROUND(total_fat_g + ?, 1),
+                    total_carb_g = ROUND(total_carb_g + ?, 1),
+                    total_fiber_g = ROUND(total_fiber_g + ?, 1)
+                WHERE date = ?
+                """,
+                (
+                    fresh_inc, warn_inc, rej_inc,
+                    w_kg, acc_kg, add_kcal, add_p, add_f, add_c, add_fib,
+                    local_date,
+                ),
+            )
+    return doc
+
+
+def list_intake_logs(
+    limit: int = 100,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    quality_status: str | None = None,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM intake_logs WHERE 1=1"
+    params: list[Any] = []
+    if date_from:
+        sql += " AND local_date >= ?"
+        params.append(date_from)
+    if date_to:
+        sql += " AND local_date <= ?"
+        params.append(date_to)
+    if quality_status:
+        sql += " AND quality_status = ?"
+        params.append(quality_status.upper())
+    sql += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+    with get_db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_intake_log(log_id: str) -> bool:
+    with get_db_conn() as conn:
+        cur = conn.execute("DELETE FROM intake_logs WHERE id = ?", (log_id,))
+        return cur.rowcount > 0
+
+
+def get_daily_analytics(days: int = 14) -> list[dict[str, Any]]:
+    cutoff = (datetime.now() - timedelta(days=max(1, days - 1))).strftime("%Y-%m-%d")
+    with get_db_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM daily_nutrition_analytics WHERE date >= ? ORDER BY date ASC",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_summary_kpis(days: int = 7) -> dict[str, Any]:
+    today = local_today_str()
+    week_start = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    with get_db_conn() as conn:
+        today_row = conn.execute("SELECT * FROM daily_nutrition_analytics WHERE date = ?", (today,)).fetchone()
+        week_row = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(total_batches), 0) AS total_batches,
+                COALESCE(SUM(fresh_count), 0) AS fresh_count,
+                COALESCE(SUM(warning_count), 0) AS warning_count,
+                COALESCE(SUM(rejected_count), 0) AS rejected_count,
+                COALESCE(SUM(total_weight_kg), 0.0) AS total_weight_kg,
+                COALESCE(SUM(accepted_weight_kg), 0.0) AS accepted_weight_kg,
+                COALESCE(SUM(total_kcal), 0.0) AS total_kcal,
+                COALESCE(SUM(total_protein_g), 0.0) AS total_protein_g,
+                COALESCE(SUM(total_fat_g), 0.0) AS total_fat_g,
+                COALESCE(SUM(total_carb_g), 0.0) AS total_carb_g
+            FROM daily_nutrition_analytics
+            WHERE date >= ?
+            """,
+            (week_start,),
+        ).fetchone()
+        orders_stats = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_orders,
+                SUM(CASE WHEN status IN ('PENDING', 'IN_PROGRESS') THEN 1 ELSE 0 END) AS active_orders,
+                SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_orders
+            FROM procurement_orders
+            """
+        ).fetchone()
+
+    empty_today = {
+        "date": today, "total_batches": 0, "fresh_count": 0, "warning_count": 0,
+        "rejected_count": 0, "total_weight_kg": 0.0, "accepted_weight_kg": 0.0,
+        "total_kcal": 0.0, "total_protein_g": 0.0, "total_fat_g": 0.0,
+        "total_carb_g": 0.0, "total_fiber_g": 0.0,
+    }
+    return {
+        "today": dict(today_row) if today_row else empty_today,
+        "period_days": days,
+        "period_summary": dict(week_row) if week_row else empty_today,
+        "orders": {
+            "total_orders": orders_stats["total_orders"] or 0,
+            "active_orders": orders_stats["active_orders"] or 0,
+            "completed_orders": orders_stats["completed_orders"] or 0,
+        },
+    }

@@ -1,0 +1,16 @@
+# ==============================================================================
+# Thư viện lõi dùng chung cho cả Windows (Mock/Dev) và Raspberry Pi 4 (Production)
+# ==============================================================================
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+python-dotenv>=1.0.1
+python-multipart>=0.0.9
+websockets>=12.0
+PyYAML>=6.0
+xlsxwriter>=3.2.0
+
+# Xử lý ảnh & ma trận (Trên Pi 4 nên cài qua apt: sudo apt install python3-opencv python3-numpy)
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0

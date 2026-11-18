@@ -1,0 +1,21 @@
+[Unit]
+Description=Smart Food Quality & Nutrition Station (FastAPI + YOLO26n NCNN)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/iot-food-quality-nutrition-station
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-/home/pi/iot-food-quality-nutrition-station/.env
+ExecStart=/usr/bin/python3 -m backend.main
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

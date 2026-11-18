@@ -1,0 +1,15 @@
+{
+  "name": "Trạm Kiểm Định Thực Phẩm & Dinh Dưỡng AI",
+  "short_name": "NutriStation AI",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F1F5F9",
+  "theme_color": "#0F766E",
+  "icons": [
+    {
+      "src": "/public/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

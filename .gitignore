@@ -1,0 +1,42 @@
+# Thư mục dữ liệu gốc & mã nguồn tham khảo cũ (không đẩy lên GitHub)
+IOT_CK/
+data/
+model.ncnn.bin
+model.ncnn.param
+metadata.yaml
+
+# Biến môi trường & cấu hình cục bộ
+.env
+.env.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# File sao lưu & tạm
+*.bak
+*.tmp
+*.log
+logs/
+
+# Cơ sở dữ liệu & ảnh chụp vận hành thực tế
+backend/data/*.db
+backend/data/*.db-wal
+backend/data/*.db-shm
+*.db
+backups/
+captures/*.jpg
+captures/*.png
+!captures/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
