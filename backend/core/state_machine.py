@@ -150,6 +150,13 @@ class NutritionStationStateMachine:
             confidence=confidence,
             detections=prediction.get("detections", []),
         )
+        if prediction.get("warning"):
+            quality["badge_text"] = prediction["warning"]
+            quality["recommendation"] = (
+                f"{prediction['warning']}. Vui lòng cài đặt thư viện ncnn trên Raspberry Pi 4 "
+                "hoặc chọn thực phẩm thủ công."
+            )
+            quality["alert_level"] = "warning"
         if override_quality in {"FRESH", "WARNING", "REJECTED"}:
             quality["status"] = override_quality
             quality["is_acceptable"] = override_quality != "REJECTED"
@@ -167,6 +174,7 @@ class NutritionStationStateMachine:
             "inference_time_ms": int(prediction.get("inference_time_ms", 0)),
             "fps": float(prediction.get("fps", 0.0)),
             "strategy": prediction.get("strategy", "ncnn"),
+            "warning": prediction.get("warning"),
             "detections": prediction.get("detections", []),
             "image_url": image_url,
             "quality": quality,

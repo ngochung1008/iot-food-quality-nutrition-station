@@ -188,6 +188,7 @@ class NCNNYoloDetector(BaseAIDetector):
         self.backend = "none"
         self._net = None
         self._yolo = None
+        self._cv_dnn_net = None
         self._fallback = MockAIDetector()
 
         self.class_names = load_metadata_names(settings.ncnn_metadata_path)
@@ -201,57 +202,84 @@ class NCNNYoloDetector(BaseAIDetector):
         self._load_backend()
 
     def _load_backend(self) -> None:
-        """Ưu tiên nạp C++ ncnn; nếu chưa có thì thử ultralytics NCNN; cuối cùng fallback Mock."""
+        """Ưu tiên nạp C++ ncnn; thử ultralytics hoặc cv2.dnn ONNX; cảnh báo rõ nếu thiếu trên Pi 4."""
         param_path = settings.ncnn_param_path
         bin_path = settings.ncnn_bin_path
+        onnx_candidates = [
+            settings.model_dir / "best.onnx",
+            settings.model_dir / "model.onnx",
+        ]
+        onnx_path = next((p for p in onnx_candidates if p.exists()), None)
 
         if not (param_path.exists() and bin_path.exists()):
             self.last_error = f"Không tìm thấy {param_path.name} / {bin_path.name} tại {settings.model_dir}"
-            logger.warning(f"[AI] {self.last_error} -> dùng Mock.")
-            return
+            logger.warning(f"[AI] {self.last_error}")
 
         # 1. Thử thư viện ncnn thuần (tối ưu ARM NEON trên Raspberry Pi 4)
-        try:
-            import ncnn  # type: ignore
+        if param_path.exists() and bin_path.exists():
+            try:
+                import ncnn  # type: ignore
 
-            net = ncnn.Net()
-            net.opt.use_vulkan_compute = False
-            net.opt.num_threads = self.num_threads
-            if net.load_param(str(param_path)) == 0 and net.load_model(str(bin_path)) == 0:
-                self._net = net
-                self.backend = "ncnn"
-                logger.info(
-                    f"[AI] Đã nạp YOLO26n NCNN native ({self.num_classes} lớp, {self.num_threads} luồng CPU)."
-                )
-                return
-            self.last_error = "ncnn.Net.load_param/load_model trả về mã lỗi khác 0"
-        except ImportError:
-            pass
-        except Exception as exc:
-            self.last_error = f"Lỗi nạp ncnn native: {exc}"
-            logger.warning(f"[AI] {self.last_error}")
+                net = ncnn.Net()
+                net.opt.use_vulkan_compute = False
+                net.opt.num_threads = self.num_threads
+                if net.load_param(str(param_path)) == 0 and net.load_model(str(bin_path)) == 0:
+                    self._net = net
+                    self.backend = "ncnn"
+                    self.last_error = None
+                    logger.info(
+                        f"[AI] Đã nạp YOLO26n NCNN native ({self.num_classes} lớp, {self.num_threads} luồng CPU)."
+                    )
+                    return
+                self.last_error = "ncnn.Net.load_param/load_model trả về mã lỗi khác 0"
+            except ImportError:
+                pass
+            except Exception as exc:
+                self.last_error = f"Lỗi nạp ncnn native: {exc}"
+                logger.warning(f"[AI] {self.last_error}")
 
-        # 2. Thử Ultralytics NCNN wrapper (hoạt động nếu đã cài ultralytics + ncnn)
+        # 2. Thử Ultralytics YOLO (hỗ trợ cả ncnn nếu có hoặc file .onnx/.pt)
         try:
+            import importlib.util
             from ultralytics import YOLO  # type: ignore
 
-            # Chỉ dùng ultralytics khi thư viện ncnn khả dụng hoặc ultralytics hỗ trợ
-            import importlib.util
-
-            if importlib.util.find_spec("ncnn") is not None:
+            if importlib.util.find_spec("ncnn") is not None and param_path.exists():
                 self._yolo = YOLO(str(settings.model_dir), task="detect")
                 self.backend = "ultralytics-ncnn"
+                self.last_error = None
                 logger.info(f"[AI] Đã nạp YOLO26n qua Ultralytics NCNN: {settings.model_dir}")
                 return
+            if onnx_path is not None:
+                self._yolo = YOLO(str(onnx_path), task="detect")
+                self.backend = "ultralytics-onnx"
+                self.last_error = None
+                logger.info(f"[AI] Đã nạp mô hình dự phòng qua Ultralytics ONNX: {onnx_path.name}")
+                return
         except Exception as exc:
-            self.last_error = f"Lỗi nạp ultralytics NCNN: {exc}"
+            self.last_error = f"Lỗi nạp ultralytics: {exc}"
             logger.warning(f"[AI] {self.last_error}")
 
-        logger.info("[AI] Chưa cài runtime 'ncnn' trên máy hiện tại -> tự động dự phòng MockAIDetector.")
+        # 3. Thử OpenCV cv2.dnn nếu có file ONNX
+        if onnx_path is not None:
+            try:
+                self._cv_dnn_net = cv2.dnn.readNetFromONNX(str(onnx_path))
+                self.backend = "opencv-dnn"
+                self.last_error = None
+                logger.info(f"[AI] Đã nạp mô hình dự phòng qua cv2.dnn: {onnx_path.name}")
+                return
+            except Exception as exc:
+                self.last_error = f"Lỗi nạp cv2.dnn ONNX: {exc}"
+                logger.warning(f"[AI] {self.last_error}")
+
+        self.last_error = "Chưa cài thư viện ncnn trên Pi 4"
+        if settings.mock_hardware:
+            logger.info("[AI] Chế độ MOCK_HARDWARE=True -> dùng MockAIDetector.")
+        else:
+            logger.error(f"[AI] {self.last_error} (cần chạy: pip install ncnn)")
 
     @property
     def is_ready(self) -> bool:
-        return self.backend in {"ncnn", "ultralytics-ncnn"}
+        return self.backend in {"ncnn", "ultralytics-ncnn", "ultralytics-onnx", "opencv-dnn"}
 
     def force_next(self, label: str | None = None, quality: str | None = None) -> None:
         self._fallback.force_next(label=label, quality=quality)
@@ -266,14 +294,34 @@ class NCNNYoloDetector(BaseAIDetector):
             return self._fallback.predict(frame, weight_gram)
 
         if not self.is_ready:
-            res = self._fallback.predict(frame, weight_gram)
-            res["strategy"] = "ncnn-fallback-mock"
+            if settings.mock_hardware:
+                res = self._fallback.predict(frame, weight_gram)
+                res["strategy"] = "ncnn-fallback-mock"
+                return res
+            # Trên phần cứng thật nhưng thiếu thư viện ncnn -> trả về cảnh báo rõ ràng lên UI
+            warn_msg = self.last_error or "Chưa cài thư viện ncnn trên Pi 4"
+            annotated = frame.copy()
+            cv2.rectangle(annotated, (12, 12), (annotated.shape[1] - 12, 54), (48, 59, 239), -1)
+            cv2.putText(
+                annotated,
+                "Chua cai thu vien ncnn tren Pi 4",
+                (24, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            res = _pack_prediction([], annotated, 0, strategy="missing-ncnn")
+            res["warning"] = warn_msg
             return res
 
         started = time.perf_counter()
         try:
             if self.backend == "ncnn":
                 detections = self._infer_ncnn_native(frame)
+            elif self.backend == "opencv-dnn":
+                detections = self._infer_cv_dnn(frame)
             else:
                 detections = self._infer_ultralytics(frame)
         except Exception as exc:
@@ -283,6 +331,20 @@ class NCNNYoloDetector(BaseAIDetector):
         annotated = draw_detections(frame, detections)
         elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
         return _pack_prediction(detections, annotated, elapsed_ms, strategy=self.backend)
+
+    def _infer_cv_dnn(self, frame: np.ndarray) -> list[dict[str, Any]]:
+        """Suy luận dự phòng qua cv2.dnn khi có file ONNX."""
+        h_orig, w_orig = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(
+            frame,
+            scalefactor=1.0 / 255.0,
+            size=(self.input_size, self.input_size),
+            swapRB=True,
+            crop=False,
+        )
+        self._cv_dnn_net.setInput(blob)
+        out = self._cv_dnn_net.forward()
+        return self._postprocess_yolo(out, (h_orig, w_orig))
 
     def _infer_ncnn_native(self, frame: np.ndarray) -> list[dict[str, Any]]:
         """Tiền xử lý letterbox/resize -> suy luận NCNN (in0 -> out0) -> NMS."""

@@ -67,7 +67,11 @@ def trigger_inspection(body: InspectRequest | None = None):
         override_label=req.override_label,
         override_quality=req.override_quality,
     )
-    return {"ok": True, "inspection": result}
+    return {
+        "ok": True,
+        "inspection": result,
+        "snapshot": station_service.state_machine.snapshot(),
+    }
 
 
 @router.post("/commit")

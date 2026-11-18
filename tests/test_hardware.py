@@ -33,6 +33,9 @@ def run_hardware_checks() -> int:
     if settings.mock_hardware:
         scale.set_simulated_weight(450.0)
         time.sleep(0.25)
+    else:
+        # Chờ luồng nền HX711 kịp hoàn thành mẫu đọc đầu tiên sau khi tare()
+        time.sleep(0.8)
     scale_status = scale.get_status()
     print(f"  -> Trạng thái : {scale_status['status']}")
     print(f"  -> Chi tiết   : {scale_status['message']}")

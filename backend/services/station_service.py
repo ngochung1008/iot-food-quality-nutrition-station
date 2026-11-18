@@ -169,9 +169,11 @@ class StationService:
             "classes_count": getattr(self.detector, "num_classes", 64),
             "input_size": settings.ai_input_size,
             "message": (
-                f"YOLO26n NCNN sẵn sàng ({getattr(self.detector, 'backend', '').upper()})"
+                f"YOLO26n sẵn sàng ({getattr(self.detector, 'backend', '').upper()})"
                 if ai_ready
-                else "Chưa cài runtime ncnn -> chạy Mock AI dự phòng"
+                else "Đang chạy Mock AI (MOCK_HARDWARE=True)"
+                if settings.mock_hardware
+                else (getattr(self.detector, "last_error", None) or "Chưa cài thư viện ncnn trên Pi 4")
             ),
             "files": {
                 "param_exists": settings.ncnn_param_path.exists(),

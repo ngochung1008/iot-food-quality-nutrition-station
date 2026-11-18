@@ -197,14 +197,18 @@ class LoadcellManager:
         count = 0
         for _ in range(24):
             GPIO.output(self.sck_pin, True)
+            time.sleep(0.000001)
             count = count << 1
             GPIO.output(self.sck_pin, False)
+            time.sleep(0.000001)
             if GPIO.input(self.dt_pin):
                 count += 1
 
-        # Xung thứ 25: Gain 128 Channel A
+        # Xung thứ 25: Gain 128 Channel A (độ trễ 1µs tương thích rpi-lgpio)
         GPIO.output(self.sck_pin, True)
+        time.sleep(0.000001)
         GPIO.output(self.sck_pin, False)
+        time.sleep(0.000001)
 
         # Bù 2 cho số nguyên có dấu 24-bit
         if count & 0x800000:
@@ -325,7 +329,8 @@ class LoadcellManager:
             started = time.time()
             try:
                 if self.mock_mode or (self.hardware_available and HAS_RPI_GPIO):
-                    grams = self.get_grams(samples=self.median_samples)
+                    # Dùng 3 mẫu trung vị ở luồng nền để tăng tốc độ phản hồi ~3 lần
+                    grams = self.get_grams(samples=3)
                     now = time.time()
                     with self._lock:
                         self.last_grams = round(abs(grams), 1)
@@ -356,7 +361,10 @@ class LoadcellManager:
         prev = self._history[-2] if len(self._history) >= 2 else weight
         delta = abs(weight - prev)
 
-        if weight >= settings.detect_weight_g and delta < settings.stability_delta_g:
+        if (
+            weight >= settings.detect_weight_g
+            or (self._stable_since is not None and weight >= settings.idle_weight_g)
+        ) and delta < settings.stability_delta_g:
             if self._stable_since is None:
                 self._stable_since = now
             self.is_stable = (now - self._stable_since) >= settings.stability_hold_s

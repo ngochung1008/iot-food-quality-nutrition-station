@@ -84,14 +84,14 @@ class Settings:
     hx711_sck_pin: int = int(os.getenv("HX711_SCK_PIN", "6"))
     hx711_invert_signal: bool = _parse_bool(os.getenv("HX711_INVERT_SIGNAL"), default=True)
     hx711_zero_band_g: float = float(os.getenv("HX711_ZERO_BAND_G", "0.5"))
-    hx711_median_samples: int = int(os.getenv("HX711_MEDIAN_SAMPLES", "9"))
+    hx711_median_samples: int = int(os.getenv("HX711_MEDIAN_SAMPLES", "3"))
     weight_sample_hz: int = int(os.getenv("WEIGHT_SAMPLE_HZ", "10"))
 
-    # State Machine thresholds
-    idle_weight_g: float = float(os.getenv("IDLE_WEIGHT_G", "10.0"))
+    # State Machine thresholds (hỗ trợ cả vật nhẹ ~35-60g như 1 quả trứng + chống quay vòng)
+    idle_weight_g: float = float(os.getenv("IDLE_WEIGHT_G", "8.0"))
     detect_weight_g: float = float(os.getenv("DETECT_WEIGHT_G", "15.0"))
     stability_delta_g: float = float(os.getenv("STABILITY_DELTA_G", "2.0"))
-    stability_hold_s: float = float(os.getenv("STABILITY_HOLD_S", "1.5"))
+    stability_hold_s: float = float(os.getenv("STABILITY_HOLD_S", "1.0"))
 
     # LCD I2C PCF8574
     lcd_i2c_address: int = _parse_int_hex(os.getenv("LCD_I2C_ADDRESS"), 0x27)

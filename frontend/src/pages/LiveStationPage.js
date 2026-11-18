@@ -243,8 +243,15 @@ export class LiveStationPage {
 
     document.getElementById("btn-inspect-now")?.addEventListener("click", async () => {
       try {
-        await apiClient.inspectNow();
-        this.toast("Đã hoàn tất kiểm định AI", "success");
+        const res = await apiClient.inspectNow();
+        if (res.snapshot) {
+          this.update(res.snapshot);
+        }
+        if (res.inspection?.warning) {
+          this.toast(res.inspection.warning, "error");
+        } else {
+          this.toast("Đã hoàn tất kiểm định AI", "success");
+        }
       } catch (e) {
         this.toast(`Lỗi nhận diện AI: ${e.message}`, "error");
       }

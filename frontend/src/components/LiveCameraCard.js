@@ -47,6 +47,15 @@ export function updateLiveCameraCard(snapshot) {
     return;
   }
 
+  if (insp.warning) {
+    aiBadge.className = "badge badge-danger";
+    aiBadge.textContent = insp.warning;
+    fpsBadge.textContent = "AI Offline";
+    summaryEl.innerHTML = `<span style="color:var(--danger); font-weight:700;">${insp.warning}</span> (Mã lô: ${insp.batch_code})`;
+    if (stratEl) stratEl.textContent = `Engine: ${String(insp.strategy || "missing-ncnn").toUpperCase()}`;
+    return;
+  }
+
   const confPct = Math.round((insp.confidence || 0) * 100);
   const qStatus = insp.quality?.status || "FRESH";
   aiBadge.className =
