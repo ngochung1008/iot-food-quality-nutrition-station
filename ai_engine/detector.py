@@ -196,7 +196,8 @@ class NCNNYoloDetector(BaseAIDetector):
         self.input_size = settings.ai_input_size
         self.conf_threshold = settings.ai_confidence_threshold
         self.iou_threshold = settings.ai_nms_iou_threshold
-        self.num_threads = settings.ai_num_threads
+        # Giới hạn tối đa 2 luồng CPU cho AI để chừa 2 nhân trống cho xung GPIO HX711 (tránh trễ SCK > 60µs)
+        self.num_threads = 2
         self.last_error: str | None = None
 
         self._load_backend()
@@ -222,13 +223,13 @@ class NCNNYoloDetector(BaseAIDetector):
 
                 net = ncnn.Net()
                 net.opt.use_vulkan_compute = False
-                net.opt.num_threads = self.num_threads
+                net.opt.num_threads = 2
                 if net.load_param(str(param_path)) == 0 and net.load_model(str(bin_path)) == 0:
                     self._net = net
                     self.backend = "ncnn"
                     self.last_error = None
                     logger.info(
-                        f"[AI] Đã nạp YOLO26n NCNN native ({self.num_classes} lớp, {self.num_threads} luồng CPU)."
+                        f"[AI] Đã nạp YOLO26n NCNN native ({self.num_classes} lớp, num_threads=2 - chừa 2 nhân CPU cho HX711)."
                     )
                     return
                 self.last_error = "ncnn.Net.load_param/load_model trả về mã lỗi khác 0"
@@ -389,6 +390,8 @@ class NCNNYoloDetector(BaseAIDetector):
         mat_in.substract_mean_normalize([], norm_vals)
 
         ex = self._net.create_extractor()
+        if hasattr(ex, "set_num_threads"):
+            ex.set_num_threads(2)
         ex.input("in0", mat_in)
         ret, mat_out = ex.extract("out0")
         if ret != 0:

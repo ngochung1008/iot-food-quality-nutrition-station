@@ -13,6 +13,7 @@ from ai_engine.detector import build_detector
 from backend.core.config import settings
 from backend.core.state_machine import NutritionStationStateMachine
 from backend.database.crud import (
+    add_procurement_order_item,
     get_procurement_order,
     init_database,
     insert_intake_log,
@@ -313,6 +314,109 @@ class StationService:
 
         self._on_station_event("receipt_committed", {"receipt": receipt, "snapshot": self.state_machine.snapshot()})
         return {"ok": True, "already_committed": False, "receipt": receipt, "order": updated_order}
+
+    def add_extra_item_to_order(
+        self,
+        order_id: str,
+        class_name: str | None = None,
+        required_gram: float | None = None,
+        tolerance_percent: float = 5.0,
+        mark_completed: bool = True,
+        note: str = "Bổ sung phát sinh tại trạm",
+        confirmed_by: str = "Nhân viên tiếp nhận",
+    ) -> dict[str, Any]:
+        """Bổ sung nguyên liệu phát sinh (đang cân -> tích xanh ngay) hoặc thêm thủ công vào phiếu."""
+        assert self.state_machine and self.scale
+
+        if not mark_completed:
+            if not class_name or required_gram is None:
+                raise ValueError("Vui lòng chọn nguyên liệu và nhập khối lượng (g).")
+            updated_order, new_item = add_procurement_order_item(
+                order_id=order_id,
+                class_name=class_name,
+                required_gram=float(required_gram),
+                tolerance_percent=tolerance_percent,
+                mark_completed=False,
+            )
+            self._on_station_event("order_updated", {"order": updated_order})
+            return {"ok": True, "order": updated_order, "item": new_item, "receipt": None}
+
+        if class_name and self.state_machine.current_inspection is not None:
+            cur_cls = self.state_machine.current_inspection["nutrition"]["class_name"]
+            if cur_cls.lower() != class_name.strip().lower():
+                self.state_machine.override_current_food(class_name)
+
+        insp = self.state_machine.current_inspection
+        if insp is None:
+            insp = self.state_machine.run_inspection(
+                weight_gram=float(required_gram) if required_gram is not None else self.scale.read_filtered_weight(),
+                override_label=class_name,
+            )
+
+        nut = insp["nutrition"]
+        act = nut["actual"]
+        quality_st = insp["quality"]["status"]
+        if quality_st == "REJECTED":
+            raise ValueError("Thực phẩm bị đánh giá HƯ HỎNG (REJECTED), không thể bổ sung tích xanh.")
+
+        weight_g = round(float(required_gram if required_gram is not None else insp["weight_gram"]), 1)
+        if weight_g <= 0:
+            raise ValueError("Khối lượng cân phải lớn hơn 0g để bổ sung vào phiếu.")
+
+        receipt_id = f"rec_{uuid.uuid4().hex[:12]}"
+        updated_order, new_item = add_procurement_order_item(
+            order_id=order_id,
+            class_name=nut["class_name"],
+            required_gram=weight_g,
+            tolerance_percent=tolerance_percent,
+            mark_completed=True,
+            actual_gram=weight_g,
+            quality_status=quality_st,
+            confidence=float(insp["confidence"]),
+            checked_by=confirmed_by,
+            log_id=receipt_id,
+            image_url=insp.get("image_url"),
+        )
+
+        receipt = {
+            "id": receipt_id,
+            "batch_code": insp["batch_code"],
+            "timestamp": utc_now_iso(),
+            "local_date": local_today_str(),
+            "station_id": settings.station_id,
+            "class_name": nut["class_name"],
+            "food_name_vi": nut["vietnamese_name"],
+            "food_group": nut["food_group"],
+            "weight_gram": weight_g,
+            "edible_gram": float(nut["edible_gram"]),
+            "quality_status": quality_st,
+            "confidence": float(insp["confidence"]),
+            "inference_time_ms": int(insp["inference_time_ms"]),
+            "strategy": insp["strategy"],
+            "energy_kcal": float(act["energy_kcal"]),
+            "protein_g": float(act["protein_g"]),
+            "fat_g": float(act["fat_g"]),
+            "carbohydrate_g": float(act["carbohydrate_g"]),
+            "fiber_g": float(act["fiber_g"]),
+            "calcium_mg": float(act["calcium_mg"]),
+            "iron_mg": float(act["iron_mg"]),
+            "vitamin_c_mg": float(act["vitamin_c_mg"]),
+            "image_url": insp.get("image_url"),
+            "note": note or "Bổ sung phát sinh tại trạm",
+            "confirmed_by": confirmed_by,
+            "order_id": order_id,
+            "order_item_id": new_item["id"],
+            "unit_price_per_kg": int(nut.get("unit_price_per_kg", 0)),
+            "total_price_vnd": int(nut.get("total_price_vnd", 0)),
+        }
+
+        insert_intake_log(receipt)
+        insp["committed"] = True
+        self.state_machine.last_committed_receipt = receipt
+
+        self._on_station_event("order_updated", {"order": updated_order})
+        self._on_station_event("receipt_committed", {"receipt": receipt, "snapshot": self.state_machine.snapshot()})
+        return {"ok": True, "order": updated_order, "item": new_item, "receipt": receipt}
 
 
 station_service = StationService()

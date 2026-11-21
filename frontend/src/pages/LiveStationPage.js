@@ -59,9 +59,28 @@ export class LiveStationPage {
                 <select id="station-order-select" class="select order-picker-select"></select>
                 <button id="btn-reload-orders" class="btn btn-sm btn-outline" style="flex-shrink:0;" type="button">Tải lại</button>
               </div>
+              <div class="order-actions-row">
+                <button id="btn-header-reset-order" class="btn btn-sm btn-outline" type="button">Reset phiếu</button>
+                <button id="btn-toggle-add-item" class="btn btn-sm btn-green" type="button">+ Thêm món vào phiếu</button>
+              </div>
+            </div>
+
+            <div id="manual-add-item-panel" class="manual-add-panel" style="display:none;">
+              <div style="font-size:15px; font-weight:700; color:var(--text-primary);">
+                Bổ sung nhanh nguyên liệu vào phiếu (64 lớp chuẩn)
+              </div>
+              <div class="manual-add-grid">
+                <select id="add-item-food-select" class="select" style="width:100%; min-width:0;"></select>
+                <input id="add-item-grams" class="input" type="number" min="1" step="10" value="500" placeholder="Gram (g)" style="width:100%; min-width:0;" />
+              </div>
+              <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:12px;">
+                <button id="btn-submit-add-item" class="btn btn-sm btn-green" type="button">Lưu thêm vào phiếu</button>
+                <button id="btn-cancel-add-item" class="btn btn-sm btn-outline" type="button">Đóng</button>
+              </div>
             </div>
 
             <div id="order-header-summary"></div>
+            <div id="extra-item-banner-slot"></div>
             <div id="order-banner-slot"></div>
 
             <div class="table-wrap">
@@ -89,6 +108,13 @@ export class LiveStationPage {
     renderWeightGauge(document.getElementById("weight-gauge-slot"));
     renderNutritionTable(document.getElementById("nutrition-table-slot"));
 
+    const addFoodSel = document.getElementById("add-item-food-select");
+    if (addFoodSel) {
+      addFoodSel.innerHTML = this.foodsList
+        .map((f) => `<option value="${f.class_name}">${f.vietnamese_name} (${f.class_name})</option>`)
+        .join("");
+    }
+
     this._renderOrderSelector();
     this._renderOrderChecklist();
     this._bindEvents();
@@ -114,12 +140,14 @@ export class LiveStationPage {
   _renderOrderChecklist() {
     const order = this.orders.find((o) => o.id === this.activeOrderId);
     const summaryEl = document.getElementById("order-header-summary");
+    const extraSlot = document.getElementById("extra-item-banner-slot");
     const bannerSlot = document.getElementById("order-banner-slot");
     const tbody = document.getElementById("order-checklist-tbody");
     if (!summaryEl || !bannerSlot || !tbody) return;
 
     if (!order) {
       summaryEl.innerHTML = "";
+      if (extraSlot) extraSlot.innerHTML = "";
       bannerSlot.innerHTML = `
         <div class="status-banner warning">
           <div style="font-weight:700; font-size:16px;">Chưa chọn Phiếu Yêu Cầu Nguyên Liệu</div>
@@ -254,9 +282,94 @@ export class LiveStationPage {
       bannerSlot.innerHTML = "";
     }
 
-    const insp = this.lastSnapshot?.current_inspection;
-    const detectedClass = insp?.food_name_en || insp?.nutrition?.class_name || insp?.detected_class || "";
+    const rawInsp = this.lastSnapshot?.current_inspection;
     const currentWeight = Number(this.lastSnapshot?.weight_gram || 0);
+    const insp = this.lastSnapshot?.state === "IDLE" && currentWeight < 8.0 ? null : rawInsp;
+    const detectedClass = insp?.food_name_en || insp?.nutrition?.class_name || insp?.detected_class || "";
+    const confPct = Number(insp?.confidence_percent ?? (insp?.confidence || 0) * 100);
+    const isInOrder =
+      Boolean(detectedClass) &&
+      order.items.some((it) => it.class_name.toLowerCase() === detectedClass.toLowerCase());
+    const showExtraAlert =
+      Boolean(extraSlot) &&
+      Boolean(insp) &&
+      !insp.committed &&
+      !insp.warning &&
+      confPct >= 35.0 &&
+      Boolean(detectedClass) &&
+      detectedClass.toLowerCase() !== "unknown" &&
+      !isInOrder;
+
+    if (extraSlot) {
+      if (showExtraAlert) {
+        const foodVi = insp.food_name_vi || detectedClass;
+        const wNum = Number(insp.weight_g ?? insp.weight_gram ?? currentWeight).toFixed(1);
+        const priceNum = Number(insp.total_price_vnd || 0).toLocaleString("vi-VN");
+        const isRejected = (insp.quality_status || insp.quality?.status) === "REJECTED";
+
+        extraSlot.innerHTML = `
+          <div class="extra-item-banner">
+            <div style="font-size:16px; font-weight:700; color:#9A3412;">
+              Phát hiện <strong>${foodVi}</strong> (<strong class="tabular-nums">${wNum}g</strong> — <strong class="tabular-nums">${priceNum}đ</strong>) chưa có trong phiếu yêu cầu của đầu bếp.
+            </div>
+            ${
+              isRejected
+                ? `<div style="font-size:14px; color:var(--danger); font-weight:600; margin-top:6px;">Lưu ý: Sản phẩm bị đánh giá hư hỏng (REJECTED), không thể tích xanh nhập kho.</div>`
+                : ""
+            }
+            <div style="display:flex; flex-wrap:wrap; gap:10px; margin-top:12px;">
+              <button id="btn-add-extra-item" class="btn btn-sm btn-green" type="button" ${isRejected ? "disabled" : ""}>
+                + Bổ sung vào phiếu &amp; Tích xanh
+              </button>
+              <button id="btn-commit-extra-loose" class="btn btn-sm btn-outline" type="button">
+                Lưu nhập lẻ ngoài phiếu
+              </button>
+            </div>
+          </div>`;
+
+        document.getElementById("btn-add-extra-item")?.addEventListener("click", async () => {
+          try {
+            const res = await apiClient.addExtraOrderItem(order.id, {
+              class_name: detectedClass,
+              mark_completed: true,
+              note: "Bổ sung phát sinh tại trạm",
+            });
+            playSuccessBeep();
+            if (this.lastSnapshot?.current_inspection) {
+              this.lastSnapshot.current_inspection.committed = true;
+            }
+            if (res?.order) this.onOrderEvent(res.order);
+            this.update(this.lastSnapshot, true);
+            this.toast(`Đã bổ sung & tích xanh: ${foodVi}`, "success");
+          } catch (err) {
+            playRejectAlarm();
+            this.toast(err.message, "error");
+          }
+        });
+
+        document.getElementById("btn-commit-extra-loose")?.addEventListener("click", async () => {
+          try {
+            const res = await apiClient.commitReceipt({
+              override_class: detectedClass,
+              note: "Nhập lẻ ngoài phiếu tại trạm",
+            });
+            if (res?.ok) {
+              playSuccessBeep();
+              if (this.lastSnapshot?.current_inspection) {
+                this.lastSnapshot.current_inspection.committed = true;
+              }
+              this.update(this.lastSnapshot, true);
+              this.toast(`Đã lưu nhập lẻ ngoài phiếu: ${foodVi}`, "success");
+            }
+          } catch (err) {
+            playRejectAlarm();
+            this.toast(err.message, "error");
+          }
+        });
+      } else {
+        extraSlot.innerHTML = "";
+      }
+    }
 
     tbody.innerHTML = order.items
       .map((it) => {
@@ -378,6 +491,56 @@ export class LiveStationPage {
     });
 
     document.getElementById("btn-reload-orders")?.addEventListener("click", () => this.reloadOrders());
+
+    document.getElementById("btn-header-reset-order")?.addEventListener("click", async () => {
+      if (!this.activeOrderId) {
+        this.toast("Chưa có phiếu đang chọn để reset.", "warning");
+        return;
+      }
+      try {
+        const res = await apiClient.resetOrder(this.activeOrderId);
+        this.lastInspectionCode = null;
+        this.lastOrderStatus = "PENDING";
+        if (res?.order) this.onOrderEvent(res.order);
+        if (res?.snapshot) this.update(res.snapshot, true);
+        this.toast("Đã làm trống toàn bộ dấu tích xanh của phiếu!", "success");
+      } catch (e) {
+        this.toast(e.message, "error");
+      }
+    });
+
+    const addPanel = document.getElementById("manual-add-item-panel");
+    document.getElementById("btn-toggle-add-item")?.addEventListener("click", () => {
+      if (!addPanel) return;
+      addPanel.style.display = addPanel.style.display === "none" ? "block" : "none";
+    });
+    document.getElementById("btn-cancel-add-item")?.addEventListener("click", () => {
+      if (addPanel) addPanel.style.display = "none";
+    });
+    document.getElementById("btn-submit-add-item")?.addEventListener("click", async () => {
+      if (!this.activeOrderId) {
+        this.toast("Vui lòng chọn một phiếu nguyên liệu trước.", "warning");
+        return;
+      }
+      const cls = document.getElementById("add-item-food-select")?.value;
+      const grams = Number(document.getElementById("add-item-grams")?.value || 0);
+      if (!cls || grams <= 0) {
+        this.toast("Vui lòng chọn nguyên liệu và nhập khối lượng > 0g.", "warning");
+        return;
+      }
+      try {
+        const res = await apiClient.addExtraOrderItem(this.activeOrderId, {
+          class_name: cls,
+          required_gram: grams,
+          mark_completed: false,
+        });
+        if (res?.order) this.onOrderEvent(res.order);
+        if (addPanel) addPanel.style.display = "none";
+        this.toast(`Đã thêm ${cls} (${grams}g) vào phiếu yêu cầu.`, "success");
+      } catch (e) {
+        this.toast(e.message, "error");
+      }
+    });
 
     document.getElementById("btn-tare")?.addEventListener("click", async () => {
       try {

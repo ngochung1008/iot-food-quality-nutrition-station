@@ -55,6 +55,14 @@ class CheckOrderItemRequest(BaseModel):
     note: str = ""
 
 
+class AddExtraOrderItemRequest(BaseModel):
+    class_name: str | None = None
+    required_gram: float | None = Field(default=None, gt=0.0, le=500000.0)
+    tolerance_percent: float = Field(default=5.0, ge=0.0, le=30.0)
+    mark_completed: bool = True
+    note: str = "Bổ sung phát sinh tại trạm"
+
+
 @router.get("/dishes", dependencies=[Depends(get_current_user)])
 def get_dishes(search: str | None = Query(default=None), category: str | None = Query(default=None)):
     """Danh sách món ăn chuẩn kèm định lượng nguyên liệu thuộc 64 lớp YOLO26n."""
@@ -148,3 +156,24 @@ def reset_order_checklist(order_id: str):
     snap = station_service.state_machine.reset_session()
     station_service._on_station_event("order_updated", {"order": updated})
     return {"ok": True, "order": updated, "snapshot": snap}
+
+
+@router.post("/orders/{order_id}/add-extra-item", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF, ROLE_RECEIVER))])
+def add_extra_order_item(
+    order_id: str,
+    body: AddExtraOrderItemRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Bổ sung nguyên liệu phát sinh ngoài phiếu (và tích xanh) hoặc thêm nguyên liệu thủ công vào phiếu."""
+    try:
+        return station_service.add_extra_item_to_order(
+            order_id=order_id,
+            class_name=body.class_name,
+            required_gram=body.required_gram,
+            tolerance_percent=body.tolerance_percent,
+            mark_completed=body.mark_completed,
+            note=body.note,
+            confirmed_by=user.get("full_name", user.get("username", "receiver")),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

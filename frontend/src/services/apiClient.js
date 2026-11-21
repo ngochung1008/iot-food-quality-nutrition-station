@@ -117,6 +117,11 @@ export const apiClient = {
     }),
   resetOrder: (orderId) =>
     request(`/api/kitchen/orders/${orderId}/reset`, { method: "POST" }),
+  addExtraOrderItem: (orderId, payload = {}) =>
+    request(`/api/kitchen/orders/${orderId}/add-extra-item`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 
   // Station
   getState: () => request("/api/station/state"),

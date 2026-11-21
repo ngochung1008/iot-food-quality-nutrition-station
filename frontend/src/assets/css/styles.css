@@ -291,6 +291,43 @@ body {
   margin-top: 14px;
 }
 
+.order-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.extra-item-banner {
+  background: #FFF7ED;
+  border: 2px solid #F97316;
+  border-radius: var(--radius-sm);
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  color: #7C2D12;
+}
+
+.manual-add-panel {
+  background: var(--bg-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+
+.manual-add-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(110px, 0.8fr);
+  gap: 10px;
+  margin-top: 10px;
+}
+
+@media (max-width: 640px) {
+  .manual-add-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .card-head {
   display: flex;
   align-items: center;

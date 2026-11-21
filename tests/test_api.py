@@ -35,6 +35,54 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
     filtered = LoadcellManager.filter_median_outliers(samples, tolerance_ratio=0.25)
     assert 107000 <= filtered <= 107600
 
+    # 1b. Bộ lọc Trimmed Median (bỏ 25% đầu & 25% cuối)
+    trimmed_vals = [0, 1000, 50000, 50100, 50200, 50300, 50150, 50250, 999999, 1000000]
+    trimmed = LoadcellManager.filter_trimmed_median(trimmed_vals)
+    assert 50100 <= trimmed <= 50250
+
+    # 1c. Rolling Median loại ngay dịch bit x2 (137.4g -> 276.6g) và 0.5x (137.4g -> 68.7g), plus read_raw t_elapsed > 12ms -> None
+    import hardware.loadcell as lc_mod
+    from ai_engine.detector import NCNNYoloDetector
+
+    assert NCNNYoloDetector().num_threads == 2
+
+    mgr_filt = object.__new__(lc_mod.LoadcellManager)
+    mgr_filt.zero_band_g = 0.5
+    mgr_filt._rolling_grams = lc_mod.deque([137.4, 137.5, 137.3, 137.4, 137.5], maxlen=5)
+    mgr_filt._spike_skip_count = 0
+    mgr_filt._bitshift_skip_count = 0
+    assert abs(mgr_filt._apply_rolling_median_filter(276.6) - 137.4) < 0.2
+    assert abs(mgr_filt._apply_rolling_median_filter(68.7) - 137.4) < 0.2
+    assert len(mgr_filt._rolling_grams) == 5 and all(v < 140.0 for v in mgr_filt._rolling_grams)
+
+    mgr_raw = object.__new__(lc_mod.LoadcellManager)
+    mgr_raw.mock_mode = False
+    mgr_raw.hardware_available = True
+    mgr_raw.sck_pin = 6
+    mgr_raw.dt_pin = 5
+    mgr_raw.invert_signal = True
+
+    class _SlowGPIO:
+        @staticmethod
+        def input(_):
+            return 0
+
+        @staticmethod
+        def output(*_):
+            pass
+
+    perf_seq = iter([10.0, 10.020])  # elapsed = 20ms > 12ms
+    orig_gpio, orig_has, orig_perf = lc_mod.GPIO, lc_mod.HAS_RPI_GPIO, lc_mod.time.perf_counter
+    try:
+        lc_mod.GPIO = _SlowGPIO
+        lc_mod.HAS_RPI_GPIO = True
+        lc_mod.time.perf_counter = lambda: next(perf_seq)
+        assert mgr_raw.read_raw() is None
+    finally:
+        lc_mod.GPIO = orig_gpio
+        lc_mod.HAS_RPI_GPIO = orig_has
+        lc_mod.time.perf_counter = orig_perf
+
     # 2. Chống quay vòng State Machine: 1 hoặc 2 mẫu 0g không được reset về IDLE
     class _DummyScale:
         current_weight = 45.0
@@ -356,6 +404,35 @@ def _run_e2e_test_body():
         assert r_reset_order.status_code == 200
         assert r_reset_order.json()["order"]["progress"]["completed"] == 0
 
+        # Kiểm tra bổ sung nguyên liệu phát sinh ngoài danh sách phiếu (+ Bổ sung vào phiếu & Tích xanh)
+        old_kcal = r_reset_order.json()["order"]["total_kcal"]
+        client.post("/api/station/simulate/weight", json={"weight_gram": 350.0})
+        client.post("/api/station/inspect", json={"override_label": "Banana", "override_quality": "FRESH"})
+        r_extra_done = client.post(
+            f"/api/kitchen/orders/{order_id}/add-extra-item",
+            headers=recv_hdr,
+            json={"class_name": "Banana", "mark_completed": True, "note": "Bổ sung phát sinh tại trạm"},
+        )
+        assert r_extra_done.status_code == 200, r_extra_done.text
+        ex_res = r_extra_done.json()
+        assert ex_res["item"]["class_name"] == "Banana"
+        assert ex_res["item"]["status"] == "COMPLETED"
+        assert ex_res["order"]["total_kcal"] > old_kcal
+        assert ex_res["receipt"]["note"] == "Bổ sung phát sinh tại trạm"
+        extra_log_id = ex_res["receipt"]["id"]
+
+        # Kiểm tra nút "+ Thêm món vào phiếu" (PENDING) từ 64 nguyên liệu chuẩn
+        r_add_pending = client.post(
+            f"/api/kitchen/orders/{order_id}/add-extra-item",
+            headers=recv_hdr,
+            json={"class_name": "Carrot", "required_gram": 500.0, "mark_completed": False},
+        )
+        assert r_add_pending.status_code == 200, r_add_pending.text
+        ap_res = r_add_pending.json()
+        assert ap_res["item"]["class_name"] == "Carrot"
+        assert ap_res["item"]["status"] == "PENDING"
+        assert ap_res["item"]["required_gram"] == 500.0
+
         # 6. Báo cáo, Export CSV/XLSX & Calibration (Admin)
         # Kiểm tra nút Tare / Về 0g đặt nắp nhôm (230g) -> đưa ngay về 0.0g & IDLE
         client.post("/api/station/simulate/weight", json={"weight_gram": 230.0})
@@ -392,4 +469,5 @@ def _run_e2e_test_body():
         # Dọn dẹp dữ liệu test
         client.delete(f"/api/logs/{log1_id}", headers=admin_hdr)
         client.delete(f"/api/logs/{log2_id}", headers=admin_hdr)
+        client.delete(f"/api/logs/{extra_log_id}", headers=admin_hdr)
         client.delete(f"/api/kitchen/dishes/{dish_id}", headers=chef_hdr)

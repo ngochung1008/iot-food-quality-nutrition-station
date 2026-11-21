@@ -74,6 +74,7 @@ class LoadcellManager:
         self._history: deque[float] = deque(maxlen=20)
         self._rolling_grams: deque[float] = deque(maxlen=5)
         self._spike_skip_count: int = 0
+        self._bitshift_skip_count: int = 0
         self._stable_since: float | None = None
         self._drift_since: float | None = None
         self._drift_raw_samples: deque[float] = deque(maxlen=40)
@@ -220,8 +221,8 @@ class LoadcellManager:
             return False
         return GPIO.input(self.dt_pin) == 0
 
-    def read_raw(self) -> int:
-        """Đọc 24-bit nhị phân từ HX711 kèm xung thứ 25 chốt Gain 128."""
+    def read_raw(self) -> int | None:
+        """Đọc 24-bit nhị phân từ HX711 kèm xung thứ 25; trả None nếu bị ngắt > 12ms hoặc mẫu lỗi."""
         if self.mock_mode:
             return int(round(self._mock_driver.read_raw_simulated()))
 
@@ -235,6 +236,7 @@ class LoadcellManager:
             if timeout > 0.3:
                 raise TimeoutError("HX711 không phản hồi (Timeout DOUT > 0.3s).")
 
+        t_start = time.perf_counter()
         count = 0
         for _ in range(24):
             GPIO.output(self.sck_pin, True)
@@ -250,12 +252,24 @@ class LoadcellManager:
         time.sleep(0.000001)
         GPIO.output(self.sck_pin, False)
         time.sleep(0.000001)
+        t_elapsed = time.perf_counter() - t_start
+
+        # Nếu vòng lặp 24-bit mất > 12ms -> OS context switch làm sai xung SCK (>60µs) -> bỏ qua
+        if t_elapsed > 0.012:
+            logger.debug(f"[LOADCELL] Bỏ qua mẫu HX711 bị ngắt quãng CPU (t_elapsed={t_elapsed * 1000:.2f}ms)")
+            return None
+
+        if count in (0, 0xFFFFFF, 0x7FFFFF, 0x800000):
+            return None
 
         # Bù 2 cho số nguyên có dấu 24-bit
         if count & 0x800000:
             count -= 0x1000000
 
-        return -count if self.invert_signal else count
+        val = -count if self.invert_signal else count
+        if val in (0, -1, 0x7FFFFF, -0x800000):
+            return None
+        return val
 
     @staticmethod
     def filter_median_outliers(values: list[float] | list[int], tolerance_ratio: float = 0.25) -> float:
@@ -269,29 +283,58 @@ class LoadcellManager:
             return float(statistics.mean(inliers))
         return med
 
+    @staticmethod
+    def filter_trimmed_median(values: list[float] | list[int]) -> float:
+        """Loại bỏ 25% giá trị cao nhất và 25% thấp nhất rồi lấy trung vị để Tare/Hiệu chuẩn chuẩn xác."""
+        if not values:
+            raise ValueError("Danh sách mẫu trống.")
+        sorted_vals = sorted(float(v) for v in values)
+        if len(sorted_vals) >= 4:
+            trim = max(1, len(sorted_vals) // 4)
+            core = sorted_vals[trim:-trim]
+            if core:
+                return float(statistics.median(core))
+        return float(statistics.median(sorted_vals))
+
+    def _collect_clean_raw_samples(self, samples: int) -> list[int]:
+        """Thu thập N mẫu sạch từ read_raw() (đã kiểm tra t_elapsed <= 12ms và loại mẫu bão hòa)."""
+        values: list[int] = []
+        attempts = 0
+        max_attempts = max(samples * 3, samples + 12)
+        while len(values) < samples and attempts < max_attempts:
+            attempts += 1
+            try:
+                v = self.read_raw()
+                if v is not None and v not in (0x7FFFFF, -0x800000, -1, 0):
+                    values.append(v)
+            except TimeoutError:
+                pass
+            time.sleep(0.002)
+
+        if not values:
+            raise RuntimeError("Mất kết nối HX711 (không đọc được mẫu hợp lệ).")
+        return values
+
     def read_median_raw(self, samples: int = 7) -> float:
-        """Đọc N mẫu (mặc định 7), lọc trung vị và loại ngoại lai lệch > ±25% trước khi tính trung bình."""
+        """Đọc N mẫu sạch (mặc định 7), lọc trung vị và loại ngoại lai lệch > ±25% trước khi tính trung bình."""
         with self._io_lock:
             if self.mock_mode:
                 vals = [self._mock_driver.read_raw_simulated() for _ in range(max(3, min(samples, 11)))]
                 return self.filter_median_outliers(vals)
-
-            values: list[int] = []
-            for _ in range(samples):
-                try:
-                    v = self.read_raw()
-                    if v not in (0x7FFFFF, -0x800000, -1, 0):
-                        values.append(v)
-                except TimeoutError:
-                    pass
-                time.sleep(0.005)
-
-            if not values:
-                raise RuntimeError("Mất kết nối HX711 (không đọc được mẫu hợp lệ).")
+            values = self._collect_clean_raw_samples(samples)
             return self.filter_median_outliers(values)
 
+    def read_trimmed_median_raw(self, samples: int = 21) -> float:
+        """Đọc N mẫu sạch, loại 25% đầu & 25% cuối trước khi tính trung vị (dùng cho Tare & Hiệu chuẩn)."""
+        with self._io_lock:
+            if self.mock_mode:
+                vals = [self._mock_driver.read_raw_simulated() for _ in range(max(4, min(samples, 25)))]
+                return self.filter_trimmed_median(vals)
+            values = self._collect_clean_raw_samples(samples)
+            return self.filter_trimmed_median(values)
+
     def tare(self, samples: int = 21) -> bool:
-        """Trừ bì (Zero balance): lấy trung vị N mẫu sạch làm mốc tare_offset = 0.0g.
+        """Trừ bì (Zero balance): lấy Trimmed Median (bỏ 25% đầu/cuối) của N mẫu sạch làm mốc 0.0g.
 
         Mặc định trừ bì cả khay/nắp nhôm đi kèm (21 mẫu).
         Tuyệt đối không ghi đè file hardware/calibration.json nếu đã tồn tại.
@@ -306,6 +349,7 @@ class LoadcellManager:
                 self._history.clear()
                 self._rolling_grams.clear()
                 self._spike_skip_count = 0
+                self._bitshift_skip_count = 0
                 self._stable_since = None
                 self._drift_since = None
                 self._drift_raw_samples.clear()
@@ -317,7 +361,7 @@ class LoadcellManager:
             return False
 
         try:
-            new_offset = self.read_median_raw(samples)
+            new_offset = self.read_trimmed_median_raw(samples)
             with self._lock:
                 self.offset = new_offset
                 self.last_grams = 0.0
@@ -326,10 +370,11 @@ class LoadcellManager:
                 self._history.clear()
                 self._rolling_grams.clear()
                 self._spike_skip_count = 0
+                self._bitshift_skip_count = 0
                 self._stable_since = None
                 self._drift_since = None
                 self._drift_raw_samples.clear()
-            logger.info(f"[LOADCELL] Đã Tare {samples} mẫu thành công (tare_offset={self.offset:.1f})")
+            logger.info(f"[LOADCELL] Đã Tare Trimmed Median {samples} mẫu thành công (tare_offset={self.offset:.1f})")
             return True
         except Exception as exc:
             self.last_error = f"Tare thất bại: {exc}"
@@ -337,12 +382,12 @@ class LoadcellManager:
             return False
 
     def calibrate_with_known_weight(self, known_weight_g: float, invert_if_negative: bool = True) -> dict[str, Any]:
-        """Thực hiện bước 2 hiệu chuẩn cân: đo vật chuẩn và tính toán scale_ratio mới."""
+        """Thực hiện bước 2 hiệu chuẩn cân: đo vật chuẩn (Trimmed Median 25 mẫu) và lưu scale_ratio."""
         if known_weight_g <= 0:
             return {"ok": False, "error": "Khối lượng chuẩn phải lớn hơn 0g."}
 
         try:
-            raw_loaded = self.read_median_raw(samples=25)
+            raw_loaded = self.read_trimmed_median_raw(samples=25)
             if self.mock_mode:
                 # Ở chế độ mock, giả lập delta hợp lý theo vật mẫu để test quy trình calibration UI
                 delta = known_weight_g * self.scale_ratio
@@ -468,16 +513,26 @@ class LoadcellManager:
             time.sleep(max(0.01, interval - elapsed))
 
     def _apply_rolling_median_filter(self, sample_g: float) -> float:
-        """Bộ lọc trượt Rolling Median 5 mẫu loại bỏ gai nhảy gấp đôi hoặc rớt về 0 bất thường."""
+        """Bộ lọc trượt Rolling Median 5 mẫu: loại ngay dịch bit x2 / 0.5x và rớt 0 bất thường."""
         val = max(0.0, float(sample_g))
         if len(self._rolling_grams) >= 3:
             med = float(statistics.median(self._rolling_grams))
+            is_bitshift_2x = med >= 10.0 and (1.85 * med <= val <= 2.15 * med)
+            is_bitshift_half = med >= 10.0 and (0.45 * med <= val <= 0.55 * med)
+            if is_bitshift_2x or is_bitshift_half:
+                if self._bitshift_skip_count < 8:
+                    self._bitshift_skip_count += 1
+                    logger.debug(f"[LOADCELL] Loại mẫu dịch bit ({val:.1f}g vs median {med:.1f}g)")
+                    return 0.0 if med < self.zero_band_g else med
+
             is_double_spike = med >= 15.0 and val >= med * 1.85 and (val - med) > 25.0
             is_zero_dropout = med >= 15.0 and val < 2.0
             if (is_double_spike or is_zero_dropout) and self._spike_skip_count < 2:
                 self._spike_skip_count += 1
-                return med
+                return 0.0 if med < self.zero_band_g else med
+
         self._spike_skip_count = 0
+        self._bitshift_skip_count = 0
         self._rolling_grams.append(val)
         out = float(statistics.median(self._rolling_grams))
         return 0.0 if out < self.zero_band_g else out

@@ -113,7 +113,7 @@ class Settings:
     ai_confidence_threshold: float = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.35"))
     ai_nms_iou_threshold: float = float(os.getenv("AI_NMS_IOU_THRESHOLD", "0.45"))
     ai_input_size: int = int(os.getenv("AI_INPUT_SIZE", "416"))
-    ai_num_threads: int = int(os.getenv("AI_NUM_THREADS", "4"))
+    ai_num_threads: int = int(os.getenv("AI_NUM_THREADS", "2"))
 
     # Server & Security
     host: str = os.getenv("HOST", "0.0.0.0").strip()

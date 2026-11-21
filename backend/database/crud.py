@@ -886,31 +886,6 @@ def create_procurement_order(
         return _hydrate_order(conn, order_row)
 
 
-def reset_procurement_order(order_id: str) -> dict[str, Any] | None:
-    """Đặt lại toàn bộ trạng thái tích xanh của phiếu về PENDING để demo hoặc cân nhập lại."""
-    with get_db_conn() as conn:
-        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
-        if not order_row:
-            return None
-
-        conn.execute(
-            """
-            UPDATE procurement_items
-            SET actual_gram = 0.0, quality_status = '', confidence = 0.0,
-                status = 'PENDING', checked_by = '', checked_at = '',
-                log_id = '', image_url = ''
-            WHERE order_id = ?
-            """,
-            (order_id,),
-        )
-        conn.execute(
-            "UPDATE procurement_orders SET status = 'PENDING', completed_at = NULL WHERE id = ?",
-            (order_id,),
-        )
-        updated_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
-        return _hydrate_order(conn, updated_row)
-
-
 def list_procurement_orders(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     sql = "SELECT * FROM procurement_orders WHERE 1=1"
     params: list[Any] = []
@@ -1008,6 +983,150 @@ def reset_procurement_order(order_id: str) -> dict[str, Any] | None:
         )
         updated_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
         return _hydrate_order(conn, updated_row)
+
+
+def add_procurement_order_item(
+    order_id: str,
+    class_name: str,
+    required_gram: float,
+    tolerance_percent: float = 5.0,
+    mark_completed: bool = False,
+    actual_gram: float | None = None,
+    quality_status: str = "FRESH",
+    confidence: float = 0.0,
+    checked_by: str = "",
+    log_id: str = "",
+    image_url: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Thêm nguyên liệu (phát sinh tại trạm hoặc bổ sung thủ công từ 64 loại) vào phiếu hiện tại."""
+    req_g = round(float(required_gram), 1)
+    if req_g <= 0:
+        raise ValueError("Khối lượng nguyên liệu bổ sung phải lớn hơn 0g.")
+
+    now = utc_now_iso()
+    with get_db_conn() as conn:
+        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        if not order_row:
+            raise ValueError("Không tìm thấy Phiếu yêu cầu nguyên liệu.")
+
+        fn = conn.execute(
+            "SELECT * FROM foods_nutrition WHERE LOWER(class_name) = LOWER(?)",
+            (class_name.strip(),),
+        ).fetchone()
+        if not fn:
+            raise ValueError(f"Nguyên liệu '{class_name}' không thuộc 64 lớp thực phẩm chuẩn.")
+
+        edible_ratio = float(fn["edible_portion_percent"]) / 100.0
+        factor = (req_g / 100.0) * edible_ratio
+        add_kcal = float(fn["energy_kcal"]) * factor
+        add_protein = float(fn["protein_g"]) * factor
+        add_fat = float(fn["fat_g"]) * factor
+        add_carb = float(fn["carbohydrate_g"]) * factor
+        unit_p = int(fn["unit_price_vnd_per_kg"])
+        est_cost = int(round((req_g / 1000.0) * unit_p))
+        min_acc = round(req_g * (1.0 - float(tolerance_percent) / 100.0), 1)
+
+        existing_pending = None
+        if not mark_completed:
+            existing_pending = conn.execute(
+                """
+                SELECT * FROM procurement_items
+                WHERE order_id = ? AND LOWER(class_name) = LOWER(?) AND status = 'PENDING'
+                """,
+                (order_id, fn["class_name"]),
+            ).fetchone()
+
+        if existing_pending:
+            new_req = round(float(existing_pending["required_gram"]) + req_g, 1)
+            new_min = round(new_req * (1.0 - float(existing_pending["tolerance_percent"]) / 100.0), 1)
+            new_cost = int(round((new_req / 1000.0) * unit_p))
+            item_id = existing_pending["id"]
+            conn.execute(
+                """
+                UPDATE procurement_items
+                SET required_gram = ?, min_acceptable_gram = ?, estimated_cost_vnd = ?
+                WHERE id = ?
+                """,
+                (new_req, new_min, new_cost, item_id),
+            )
+        else:
+            item_id = f"poi_{uuid.uuid4().hex[:10]}"
+            act_g = round(float(actual_gram if actual_gram is not None else req_g), 1) if mark_completed else 0.0
+            conn.execute(
+                """
+                INSERT INTO procurement_items (
+                    id, order_id, class_name, food_name_vi, food_group,
+                    required_gram, tolerance_percent, min_acceptable_gram,
+                    unit_price_per_kg, estimated_cost_vnd,
+                    actual_gram, quality_status, confidence, status,
+                    checked_by, checked_at, log_id, image_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    order_id,
+                    fn["class_name"],
+                    fn["vietnamese_name"],
+                    fn["food_group"],
+                    req_g,
+                    float(tolerance_percent),
+                    min_acc,
+                    unit_p,
+                    est_cost,
+                    act_g,
+                    quality_status if mark_completed else "",
+                    round(float(confidence), 3) if mark_completed else 0.0,
+                    "COMPLETED" if mark_completed else "PENDING",
+                    checked_by if mark_completed else "",
+                    now if mark_completed else "",
+                    log_id if mark_completed else "",
+                    (image_url or "") if mark_completed else "",
+                ),
+            )
+
+        # Cập nhật tổng dinh dưỡng & chi phí dự kiến của phiếu
+        conn.execute(
+            """
+            UPDATE procurement_orders
+            SET total_kcal = ROUND(total_kcal + ?, 1),
+                total_protein_g = ROUND(total_protein_g + ?, 1),
+                total_fat_g = ROUND(total_fat_g + ?, 1),
+                total_carb_g = ROUND(total_carb_g + ?, 1),
+                estimated_total_cost_vnd = estimated_total_cost_vnd + ?
+            WHERE id = ?
+            """,
+            (add_kcal, add_protein, add_fat, add_carb, est_cost, order_id),
+        )
+
+        # Cập nhật lại trạng thái đơn hàng dựa trên tiến độ các dòng
+        pending_cnt = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM procurement_items WHERE order_id = ? AND status != 'COMPLETED'",
+            (order_id,),
+        ).fetchone()["cnt"]
+        completed_cnt = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM procurement_items WHERE order_id = ? AND status = 'COMPLETED'",
+            (order_id,),
+        ).fetchone()["cnt"]
+
+        if pending_cnt == 0 and completed_cnt > 0:
+            conn.execute(
+                "UPDATE procurement_orders SET status = 'COMPLETED', completed_at = ? WHERE id = ?",
+                (now, order_id),
+            )
+        elif completed_cnt > 0:
+            conn.execute(
+                "UPDATE procurement_orders SET status = 'IN_PROGRESS', completed_at = NULL WHERE id = ?",
+                (order_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE procurement_orders SET status = 'PENDING', completed_at = NULL WHERE id = ?",
+                (order_id,),
+            )
+
+        updated_order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        item_row = conn.execute("SELECT * FROM procurement_items WHERE id = ?", (item_id,)).fetchone()
+        return _hydrate_order(conn, updated_order_row), dict(item_row)
 
 
 # ==============================================================================
