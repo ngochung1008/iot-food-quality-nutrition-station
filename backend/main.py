@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,13 +21,41 @@ from backend.core.config import settings
 from backend.core.logger import logger
 from backend.services.station_service import station_service
 
+SHUTDOWN_EVENT = threading.Event()
+
+
+def _install_uvicorn_exit_hook() -> None:
+    """Đặt SHUTDOWN_EVENT và đóng kết nối streaming ngay tức thì khi nhấn Ctrl+C."""
+    try:
+        import uvicorn
+
+        orig_handle_exit = uvicorn.Server.handle_exit
+        if getattr(orig_handle_exit, "_fk_wrapped", False):
+            return
+
+        def _handle_exit_with_event(self, sig, frame):
+            SHUTDOWN_EVENT.set()
+            station_service.ws_hub.close_all()
+            return orig_handle_exit(self, sig, frame)
+
+        _handle_exit_with_event._fk_wrapped = True  # type: ignore[attr-defined]
+        uvicorn.Server.handle_exit = _handle_exit_with_event  # type: ignore[method-assign]
+    except Exception:
+        pass
+
+
+_install_uvicorn_exit_hook()
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Khởi động và dọn dẹp sạch phần cứng + AI khi bật/tắt FastAPI server."""
+    SHUTDOWN_EVENT.clear()
     station_service.ws_hub.set_loop(asyncio.get_running_loop())
     station_service.start()
     yield
+    SHUTDOWN_EVENT.set()
+    station_service.ws_hub.close_all()
     station_service.stop()
 
 
@@ -81,12 +110,14 @@ def health_check():
 
 
 @app.get("/video_feed")
-async def video_feed():
+async def video_feed(request: Request):
     """Luồng video MJPEG trực tiếp kèm overlay bounding box từ CameraManager."""
 
     async def frame_generator():
         try:
             while True:
+                if SHUTDOWN_EVENT.is_set() or await request.is_disconnected():
+                    break
                 if station_service.camera:
                     chunk = station_service.camera.mjpeg_bytes()
                     if chunk:
@@ -115,7 +146,7 @@ async def websocket_station(websocket: WebSocket):
                 "event": "snapshot",
                 "data": station_service.state_machine.snapshot(),
             })
-        while True:
+        while not SHUTDOWN_EVENT.is_set():
             # Giữ kết nối mở và nhận lệnh ping/keepalive từ client nếu có
             await websocket.receive_text()
     except (WebSocketDisconnect, asyncio.CancelledError):
@@ -142,5 +173,5 @@ if __name__ == "__main__":
         port=settings.port,
         reload=False,
         log_level="info",
-        timeout_graceful_shutdown=2,
+        timeout_graceful_shutdown=1,
     )

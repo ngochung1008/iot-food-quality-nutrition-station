@@ -47,6 +47,27 @@ class WebSocketHub:
         with self._lock:
             self._clients.discard(ws)
 
+    def close_all(self) -> None:
+        """Đóng toàn bộ kết nối WebSocket đang mở khi tắt server."""
+        if self._loop is None or self._loop.is_closed():
+            return
+        with self._lock:
+            clients = list(self._clients)
+        if not clients:
+            return
+
+        async def _close_clients() -> None:
+            for ws in clients:
+                try:
+                    await ws.close(code=1001)
+                except Exception:
+                    pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_close_clients(), self._loop)
+        except Exception:
+            pass
+
     def broadcast_sync(self, message: dict[str, Any]) -> None:
         """Gửi bản tin JSON tới tất cả WebSocket clients từ luồng đọc phần cứng."""
         if self._loop is None or self._loop.is_closed():
