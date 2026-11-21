@@ -48,12 +48,24 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
 
     mgr_filt = object.__new__(lc_mod.LoadcellManager)
     mgr_filt.zero_band_g = 0.5
-    mgr_filt._rolling_grams = lc_mod.deque([137.4, 137.5, 137.3, 137.4, 137.5], maxlen=5)
+    mgr_filt._rolling_grams = lc_mod.deque([137.4, 137.5, 137.3], maxlen=3)
     mgr_filt._spike_skip_count = 0
     mgr_filt._bitshift_skip_count = 0
+    mgr_filt._step_jump_count = 0
     assert abs(mgr_filt._apply_rolling_median_filter(276.6) - 137.4) < 0.2
     assert abs(mgr_filt._apply_rolling_median_filter(68.7) - 137.4) < 0.2
-    assert len(mgr_filt._rolling_grams) == 5 and all(v < 140.0 for v in mgr_filt._rolling_grams)
+    assert len(mgr_filt._rolling_grams) == 3 and all(v < 140.0 for v in mgr_filt._rolling_grams)
+
+    # Nhảy tải > 5.0g trong 2 nhịp liên tiếp (0g -> 48.5g) -> xóa bộ đệm cũ và cập nhật tức thì
+    mgr_jump = object.__new__(lc_mod.LoadcellManager)
+    mgr_jump.zero_band_g = 0.5
+    mgr_jump._rolling_grams = lc_mod.deque([0.0, 0.0, 0.0], maxlen=3)
+    mgr_jump._spike_skip_count = 0
+    mgr_jump._bitshift_skip_count = 0
+    mgr_jump._step_jump_count = 0
+    mgr_jump._apply_rolling_median_filter(48.5)
+    assert mgr_jump._apply_rolling_median_filter(48.7) == 48.7
+    assert list(mgr_jump._rolling_grams) == [48.7]
 
     mgr_raw = object.__new__(lc_mod.LoadcellManager)
     mgr_raw.mock_mode = False
@@ -226,35 +238,38 @@ def test_loadcell_auto_zero_drift_and_startup_tare():
     mgr.current_weight = 2.0
     mgr.station_state = "IDLE"
     mgr.auto_zero_min_g = 0.1
-    mgr.auto_zero_max_g = 3.5
-    mgr.auto_zero_hold_s = 3.0
+    mgr.auto_zero_max_g = 0.8
+    mgr.auto_zero_hold_s = 4.0
     mgr._history = lc_mod.deque(maxlen=20)
-    mgr._rolling_grams = lc_mod.deque(maxlen=5)
+    mgr._rolling_grams = lc_mod.deque(maxlen=3)
     mgr._spike_skip_count = 0
+    mgr._bitshift_skip_count = 0
+    mgr._step_jump_count = 0
     mgr._drift_since = None
     mgr._drift_raw_samples = lc_mod.deque(maxlen=40)
 
-    drift_adc = 10000.0 + 2.0 * mgr.scale_ratio  # lệch nhẹ 2.0g
+    drift_adc = 10000.0 + 0.6 * mgr.scale_ratio  # lệch nhẹ 0.6g (nằm trong 0.1g..0.8g)
 
     # Trong STABILIZING không được Auto-Zero
     mgr.station_state = "STABILIZING"
-    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 100.0) is False
-    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 104.0) is False
+    assert mgr._track_auto_zero_drift(drift_adc, 0.6, 100.0) is False
+    assert mgr._track_auto_zero_drift(drift_adc, 0.6, 105.0) is False
     assert mgr.offset == 10000.0
 
-    # Chuyển về IDLE: giữ lệch nhẹ 2.0g trước 3.0s chưa cập nhật, đủ 3.0s phải cập nhật tare_offset -> 0.0g
+    # Chuyển về IDLE: giữ lệch nhẹ 0.6g trước 4.0s chưa cập nhật, đủ 4.0s phải cập nhật tare_offset -> 0.0g
     mgr.station_state = "IDLE"
-    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 200.0) is False
-    assert mgr._track_auto_zero_drift(drift_adc, 2.1, 202.5) is False
+    assert mgr._track_auto_zero_drift(drift_adc, 0.6, 200.0) is False
+    assert mgr._track_auto_zero_drift(drift_adc, 0.6, 203.5) is False
     assert mgr.offset == 10000.0
-    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 203.05) is True
+    assert mgr._track_auto_zero_drift(drift_adc, 0.6, 204.05) is True
     assert abs(mgr.offset - drift_adc) < 50.0
     assert mgr.current_weight == 0.0
 
-    # Nếu > 3.5g (như đặt vật thật 50g) không bao giờ Auto-Zero dù ở IDLE > 3.0s
+    # Nếu > 0.8g (ví dụ 2.0g hoặc đặt vật 50g) không bao giờ Auto-Zero dù ở IDLE > 4.0s
     old_offset = mgr.offset
-    assert mgr._track_auto_zero_drift(old_offset + 50.0 * mgr.scale_ratio, 50.0, 300.0) is False
-    assert mgr._track_auto_zero_drift(old_offset + 50.0 * mgr.scale_ratio, 50.0, 305.0) is False
+    assert mgr._track_auto_zero_drift(old_offset + 2.0 * mgr.scale_ratio, 2.0, 300.0) is False
+    assert mgr._track_auto_zero_drift(old_offset + 2.0 * mgr.scale_ratio, 2.0, 305.0) is False
+    assert mgr._track_auto_zero_drift(old_offset + 50.0 * mgr.scale_ratio, 50.0, 310.0) is False
     assert mgr.offset == old_offset
 
     # 2. Kiểm tra _init_gpio chờ >= 0.5s và gọi tare(samples=21)

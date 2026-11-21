@@ -76,15 +76,16 @@ class LoadcellManager:
         self._raw_buffer: deque[tuple[float, float]] = deque(maxlen=30)
         self._raw_seq: int = 0
         self._history: deque[float] = deque(maxlen=20)
-        self._rolling_grams: deque[float] = deque(maxlen=5)
+        self._rolling_grams: deque[float] = deque(maxlen=3)
         self._spike_skip_count: int = 0
         self._bitshift_skip_count: int = 0
+        self._step_jump_count: int = 0
         self._stable_since: float | None = None
         self._drift_since: float | None = None
         self._drift_raw_samples: deque[float] = deque(maxlen=40)
         self.auto_zero_min_g: float = 0.1
-        self.auto_zero_max_g: float = 3.5
-        self.auto_zero_hold_s: float = 3.0
+        self.auto_zero_max_g: float = 0.8
+        self.auto_zero_hold_s: float = 4.0
         self._mock_driver = MockScaleDriver()
 
         # 1. Nạp hệ số hiệu chuẩn từ hardware/calibration.json
@@ -413,6 +414,7 @@ class LoadcellManager:
                 self._rolling_grams.clear()
                 self._spike_skip_count = 0
                 self._bitshift_skip_count = 0
+                self._step_jump_count = 0
                 self._stable_since = None
                 self._drift_since = None
                 self._drift_raw_samples.clear()
@@ -437,6 +439,7 @@ class LoadcellManager:
                 self._rolling_grams.clear()
                 self._spike_skip_count = 0
                 self._bitshift_skip_count = 0
+                self._step_jump_count = 0
                 self._stable_since = None
                 self._drift_since = None
                 self._drift_raw_samples.clear()
@@ -513,10 +516,11 @@ class LoadcellManager:
         return 0.0 if grams < self.zero_band_g else float(grams)
 
     def _track_auto_zero_drift(self, raw_adc: float, unclamped_g: float, now: float) -> bool:
-        """Tự động bù trôi điểm 0 khi IDLE và cân trôi nhẹ 0.1g..3.5g liên tục >= 3.0s."""
+        """Tự động bù trôi điểm 0 khi IDLE và cân trôi nhẹ 0.1g..0.8g liên tục >= 4.0s."""
+        drift_g = abs(float(unclamped_g))
         if (
             self.station_state == "IDLE"
-            and self.auto_zero_min_g <= unclamped_g <= self.auto_zero_max_g
+            and self.auto_zero_min_g <= drift_g <= self.auto_zero_max_g
         ):
             self._drift_raw_samples.append(float(raw_adc))
             if self._drift_since is None:
@@ -534,12 +538,13 @@ class LoadcellManager:
                 self._rolling_grams.clear()
                 self._history.clear()
                 self._spike_skip_count = 0
+                self._step_jump_count = 0
                 self.last_grams = 0.0
                 self.current_weight = 0.0
                 self._drift_since = None
                 self._drift_raw_samples.clear()
                 logger.info(
-                    f"[LOADCELL] Auto-Zero Drift: đã bù trôi nhẹ {unclamped_g:.2f}g -> 0.0g (tare_offset={self.offset:.1f})"
+                    f"[LOADCELL] Auto-Zero Drift: đã bù trôi nhẹ {drift_g:.2f}g -> 0.0g (tare_offset={self.offset:.1f})"
                 )
                 return True
             return False
@@ -569,8 +574,8 @@ class LoadcellManager:
         return abs((raw_adc - self.offset) / self.scale_ratio)
 
     def _reader_loop(self) -> None:
-        """Luồng ĐỘC QUYỀN đọc GPIO HX711: đẩy 30 mẫu thô sạch vào bộ đệm vòng & lọc 10Hz."""
-        interval = 1.0 / max(1, settings.weight_sample_hz)
+        """Luồng ĐỘC QUYỀN đọc GPIO HX711 ~15-20Hz: đẩy 30 mẫu thô sạch vào bộ đệm vòng & lọc 3 mẫu."""
+        interval = 0.05
         while not self._stop_event.is_set():
             started = time.time()
             try:
@@ -610,23 +615,36 @@ class LoadcellManager:
             time.sleep(max(0.01, interval - elapsed))
 
     def _apply_rolling_median_filter(self, sample_g: float) -> float:
-        """Bộ lọc trượt Rolling Median 5 mẫu: loại ngay dịch bit x2 / 0.5x và rớt 0 bất thường."""
+        """Rolling Median 3 mẫu: loại ngay dịch bit x2 / 0.5x & cập nhật tức thì khi đổi > 5.0g trong 2 nhịp."""
         val = max(0.0, float(sample_g))
-        if len(self._rolling_grams) >= 3:
+        if len(self._rolling_grams) >= 2:
             med = float(statistics.median(self._rolling_grams))
             is_bitshift_2x = med >= 10.0 and (1.85 * med <= val <= 2.15 * med)
             is_bitshift_half = med >= 10.0 and (0.45 * med <= val <= 0.55 * med)
             if is_bitshift_2x or is_bitshift_half:
                 if self._bitshift_skip_count < 8:
                     self._bitshift_skip_count += 1
+                    self._step_jump_count = 0
                     logger.debug(f"[LOADCELL] Loại mẫu dịch bit ({val:.1f}g vs median {med:.1f}g)")
                     return 0.0 if med < self.zero_band_g else med
 
-            is_double_spike = med >= 15.0 and val >= med * 1.85 and (val - med) > 25.0
             is_zero_dropout = med >= 15.0 and val < 2.0
-            if (is_double_spike or is_zero_dropout) and self._spike_skip_count < 2:
+            if is_zero_dropout and self._spike_skip_count < 2:
                 self._spike_skip_count += 1
+                self._step_jump_count = 0
                 return 0.0 if med < self.zero_band_g else med
+
+            if abs(val - med) > 5.0:
+                self._step_jump_count += 1
+                if self._step_jump_count >= 2:
+                    self._rolling_grams.clear()
+                    self._rolling_grams.append(val)
+                    self._spike_skip_count = 0
+                    self._bitshift_skip_count = 0
+                    self._step_jump_count = 0
+                    return 0.0 if val < self.zero_band_g else val
+            else:
+                self._step_jump_count = 0
 
         self._spike_skip_count = 0
         self._bitshift_skip_count = 0
@@ -681,6 +699,8 @@ class LoadcellManager:
             self._rolling_grams.clear()
             self._rolling_grams.append(val)
             self._spike_skip_count = 0
+            self._bitshift_skip_count = 0
+            self._step_jump_count = 0
             self.last_grams = val
             self.current_weight = val
             self.last_sample_time = time.time()
