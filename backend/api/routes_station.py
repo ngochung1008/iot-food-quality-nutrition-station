@@ -52,14 +52,16 @@ def get_station_state():
 
 @router.post("/tare")
 def tare_scale():
-    """Trừ bì (Tare) đưa bàn cân về 0.0g."""
+    """Trừ bì (Tare) đưa bàn cân (kèm nắp/khay) về 0.0g và reset trạng thái về IDLE ngay lập tức."""
     ok = station_service.scale.tare(samples=21)
     if not ok:
         raise HTTPException(status_code=503, detail=station_service.scale.last_error or "Tare thất bại.")
+    snap = station_service.state_machine.reset_after_tare()
     return {
         "ok": True,
         "weight_gram": float(station_service.scale.current_weight),
         "scale_online": station_service.scale.scale_online,
+        "snapshot": snap,
     }
 
 

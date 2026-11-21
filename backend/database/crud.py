@@ -117,10 +117,169 @@ SEED_DISHES: list[dict[str, Any]] = [
 ]
 
 SEED_USERS: list[tuple[str, str, str, str]] = [
-    ("admin", "admin123", "Nguyễn Văn Quản Lý", ROLE_ADMIN),
-    ("chef", "chef123", "Trần Minh Đầu Bếp", ROLE_CHEF),
-    ("receiver", "receiver123", "Lê Thị Kiểm Định", ROLE_RECEIVER),
+    ("admin", "admin123", "Đặng Nguyễn Hữu Huy", ROLE_ADMIN),
+    ("chef", "chef123", "Phạm Hữu Tuân", ROLE_CHEF),
+    ("khiem", "receiver123", "Nguyễn Chánh Khiêm", ROLE_RECEIVER),
+    ("receiver", "receiver123", "Nguyễn Chánh Khiêm", ROLE_RECEIVER),
+    ("hung", "receiver123", "Phạm Ngọc Hưng", ROLE_RECEIVER),
 ]
+
+
+def _seed_demo_procurement_orders(conn: Any) -> None:
+    """Seed 3 phiếu yêu cầu nguyên liệu mẫu (PENDING) chuẩn bị demo nếu chưa có."""
+    now_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    today_dt = datetime.now()
+    food_rows = conn.execute("SELECT * FROM foods_nutrition").fetchall()
+    food_map = {r["class_name"]: dict(r) for r in food_rows}
+
+    demo_specs = [
+        {
+            "order_code": "PO-DEMO-EGG-01",
+            "title": "[DEMO TRƯỜNG] Bữa sáng Trứng ốp la & Trứng luộc",
+            "meal_date": today_dt.strftime("%Y-%m-%d"),
+            "meal_shift": "Ca Sáng",
+            "servings": 1,
+            "target_kcal_per_serving": 150.0,
+            "note": "Phiếu demo trực tiếp 1 quả trứng gà thật (~50g) tại trạm cân Raspberry Pi 4.",
+            "dish_name": "Trứng gà ốp la & Trứng luộc (Demo 1 suất)",
+            "dish_category": "Bữa sáng Demo",
+            "created_at": now_dt.isoformat().replace("+00:00", "Z"),
+            "ingredients": [("Egg", 50.0)],
+        },
+        {
+            "order_code": "PO-DEMO-MON-02",
+            "title": "Thực đơn Trưa Thứ Hai — Cơm gà kho & Canh rau củ",
+            "meal_date": (today_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+            "meal_shift": "Ca Trưa",
+            "servings": 100,
+            "target_kcal_per_serving": 650.0,
+            "note": "Thực đơn mẫu bếp ăn tập thể 100 suất: Thịt gà kho trứng cùng canh khoai tây cà rốt cà chua.",
+            "dish_name": "Cơm gà kho trứng & Canh rau củ thập cẩm",
+            "dish_category": "Thực đơn Ca Trưa",
+            "created_at": (now_dt - timedelta(seconds=10)).isoformat().replace("+00:00", "Z"),
+            "ingredients": [
+                ("Chicken", 15000.0),
+                ("Potato", 10000.0),
+                ("Tomato", 6000.0),
+                ("Carrot", 6000.0),
+                ("Egg", 5000.0),
+            ],
+        },
+        {
+            "order_code": "PO-DEMO-TUE-03",
+            "title": "Thực đơn Chiều Thứ Ba — Cá sốt cà & Tráng miệng",
+            "meal_date": (today_dt + timedelta(days=2)).strftime("%Y-%m-%d"),
+            "meal_shift": "Ca Chiều",
+            "servings": 120,
+            "target_kcal_per_serving": 600.0,
+            "note": "Thực đơn mẫu bếp ăn tập thể 120 suất: Cá sốt cà chua, dưa chuột và chuối tráng miệng.",
+            "dish_name": "Cá sốt cà chua, Dưa chuột & Chuối tráng miệng",
+            "dish_category": "Thực đơn Ca Chiều",
+            "created_at": (now_dt - timedelta(seconds=20)).isoformat().replace("+00:00", "Z"),
+            "ingredients": [
+                ("Fish", 18000.0),
+                ("Banana", 10800.0),
+                ("Cucumber", 9600.0),
+                ("Tomato", 7200.0),
+            ],
+        },
+    ]
+
+    for spec in demo_specs:
+        exists = conn.execute(
+            "SELECT id FROM procurement_orders WHERE order_code = ?",
+            (spec["order_code"],),
+        ).fetchone()
+        if exists:
+            continue
+
+        order_id = f"ord_{uuid.uuid4().hex[:10]}"
+        total_kcal = 0.0
+        total_protein = 0.0
+        total_fat = 0.0
+        total_carb = 0.0
+        est_total_cost = 0
+
+        item_rows: list[tuple[Any, ...]] = []
+        tolerance = 5.0
+        for cls_name, req_g in spec["ingredients"]:
+            fn = food_map.get(cls_name)
+            if not fn:
+                continue
+            edible_ratio = float(fn["edible_portion_percent"]) / 100.0
+            factor = (req_g / 100.0) * edible_ratio
+            total_kcal += float(fn["energy_kcal"]) * factor
+            total_protein += float(fn["protein_g"]) * factor
+            total_fat += float(fn["fat_g"]) * factor
+            total_carb += float(fn["carbohydrate_g"]) * factor
+
+            unit_p = int(fn["unit_price_vnd_per_kg"])
+            est_cost = int(round((req_g / 1000.0) * unit_p))
+            est_total_cost += est_cost
+            min_acc = round(req_g * (1.0 - tolerance / 100.0), 1)
+            item_rows.append((
+                f"poi_{uuid.uuid4().hex[:10]}",
+                order_id,
+                fn["class_name"],
+                fn["vietnamese_name"],
+                fn["food_group"],
+                req_g,
+                tolerance,
+                min_acc,
+                unit_p,
+                est_cost,
+            ))
+
+        dishes_json = json.dumps(
+            [
+                {
+                    "id": 0,
+                    "name_vi": spec["dish_name"],
+                    "category": spec["dish_category"],
+                    "kcal_per_serving": round(total_kcal / spec["servings"], 1),
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+        conn.execute(
+            """
+            INSERT INTO procurement_orders (
+                id, order_code, title, meal_date, meal_shift, servings, dishes_json,
+                total_kcal, total_protein_g, total_fat_g, total_carb_g,
+                target_kcal_per_serving, estimated_total_cost_vnd,
+                status, created_by, created_at, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 'chef', ?, ?)
+            """,
+            (
+                order_id,
+                spec["order_code"],
+                spec["title"],
+                spec["meal_date"],
+                spec["meal_shift"],
+                spec["servings"],
+                dishes_json,
+                round(total_kcal, 1),
+                round(total_protein, 1),
+                round(total_fat, 1),
+                round(total_carb, 1),
+                float(spec["target_kcal_per_serving"]),
+                est_total_cost,
+                spec["created_at"],
+                spec["note"],
+            ),
+        )
+        for row_vals in item_rows:
+            conn.execute(
+                """
+                INSERT INTO procurement_items (
+                    id, order_id, class_name, food_name_vi, food_group,
+                    required_gram, tolerance_percent, min_acceptable_gram,
+                    unit_price_per_kg, estimated_cost_vnd, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                """,
+                row_vals,
+            )
 
 
 def utc_now_iso() -> str:
@@ -203,7 +362,7 @@ def init_database() -> None:
                 (profile.unit_price_vnd_per_kg, profile.class_name),
             )
 
-        # 2. Seed 3 tài khoản demo RBAC
+        # 2. Seed tài khoản thành viên RBAC (tạo mới hoặc cập nhật họ tên/vai trò nếu đã tồn tại)
         for uname, raw_pw, fname, role in SEED_USERS:
             existing = conn.execute("SELECT id FROM users WHERE username = ?", (uname,)).fetchone()
             if not existing:
@@ -213,6 +372,11 @@ def init_database() -> None:
                     VALUES (?, ?, ?, ?, 1, ?)
                     """,
                     (uname, hash_password(raw_pw), fname, role, now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE users SET full_name = ?, role = ?, is_active = 1 WHERE username = ?",
+                    (fname, role, uname),
                 )
 
         # 3. Seed 14 món ăn chuẩn (chỉ thêm nếu chưa có)
@@ -237,7 +401,10 @@ def init_database() -> None:
                     (dish_id, cls_name, grams),
                 )
 
-    logger.info("[DB] Đã khởi tạo SQLite Enterprise (Users, 64 Foods, 14 Dishes, Procurement, Logs).")
+        # 4. Seed 3 phiếu chuẩn bị nguyên liệu mẫu cho Demo bảo vệ (PENDING)
+        _seed_demo_procurement_orders(conn)
+
+    logger.info("[DB] Đã khởi tạo SQLite Enterprise (Users, 64 Foods, 14 Dishes, Demo Orders, Logs).")
 
 
 # ==============================================================================

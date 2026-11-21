@@ -307,7 +307,10 @@ export class LiveStationPage {
 
     document.getElementById("btn-tare")?.addEventListener("click", async () => {
       try {
-        await apiClient.tare();
+        const res = await apiClient.tare();
+        if (res?.snapshot) {
+          this.update(res.snapshot, true);
+        }
         this.toast("Đã đưa cân về 0.0g (Tare)", "success");
       } catch (e) {
         this.toast(`Lỗi Tare: ${e.message}`, "error");

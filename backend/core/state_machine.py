@@ -77,12 +77,26 @@ class NutritionStationStateMachine:
             self.active_order_id = order_id.strip() if order_id else None
             return self.active_order_id
 
+    def reset_after_tare(self) -> dict[str, Any]:
+        """Đưa ngay State Machine về IDLE sau khi người dùng bấm Tare / Về 0g."""
+        with self._lock:
+            self.state = StationState.IDLE
+            self.current_inspection = None
+            self._below_idle_count = 0
+            self.scale.station_state = self.state.value
+            if self.camera:
+                self.camera.set_overlay_detections([])
+            snap = self.snapshot()
+        self._emit("state_change", snap)
+        return snap
+
     def update(self) -> str:
         """Cập nhật một chu kỳ State Machine (gọi 10 lần/giây)."""
         w = self.scale.read_filtered_weight()
         need_inspect = False
         with self._lock:
             prev = self.state
+            self.scale.station_state = self.state.value
             if self.state == StationState.IDLE:
                 self._below_idle_count = 0
                 if w >= settings.detect_weight_g:
@@ -118,6 +132,8 @@ class NutritionStationStateMachine:
                         self.camera.set_overlay_detections([])
                 else:
                     self._below_idle_count = 0
+
+            self.scale.station_state = self.state.value
 
         if need_inspect:
             if self.lcd:

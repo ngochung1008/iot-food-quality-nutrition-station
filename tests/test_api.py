@@ -68,6 +68,93 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
     assert sm.update() == StationState.IDLE.value
 
 
+def test_loadcell_auto_zero_drift_and_startup_tare():
+    """Kiểm tra khởi động _init_gpio (0.5s + tare 21 mẫu) và Auto-Zero Drift Tracking 0.1g..3.5g trong 3.0s."""
+    import hardware.loadcell as lc_mod
+
+    # 1. Tạo instance cô lập không đụng Singleton toàn cục để kiểm tra Auto-Zero Drift
+    mgr = object.__new__(lc_mod.LoadcellManager)
+    mgr.mock_mode = False
+    mgr.scale_ratio = -326.1189
+    mgr.offset = 10000.0
+    mgr.last_grams = 2.0
+    mgr.current_weight = 2.0
+    mgr.station_state = "IDLE"
+    mgr.auto_zero_min_g = 0.1
+    mgr.auto_zero_max_g = 3.5
+    mgr.auto_zero_hold_s = 3.0
+    mgr._history = lc_mod.deque(maxlen=20)
+    mgr._rolling_grams = lc_mod.deque(maxlen=5)
+    mgr._spike_skip_count = 0
+    mgr._drift_since = None
+    mgr._drift_raw_samples = lc_mod.deque(maxlen=40)
+
+    drift_adc = 10000.0 + 2.0 * mgr.scale_ratio  # lệch nhẹ 2.0g
+
+    # Trong STABILIZING không được Auto-Zero
+    mgr.station_state = "STABILIZING"
+    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 100.0) is False
+    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 104.0) is False
+    assert mgr.offset == 10000.0
+
+    # Chuyển về IDLE: giữ lệch nhẹ 2.0g trước 3.0s chưa cập nhật, đủ 3.0s phải cập nhật tare_offset -> 0.0g
+    mgr.station_state = "IDLE"
+    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 200.0) is False
+    assert mgr._track_auto_zero_drift(drift_adc, 2.1, 202.5) is False
+    assert mgr.offset == 10000.0
+    assert mgr._track_auto_zero_drift(drift_adc, 2.0, 203.05) is True
+    assert abs(mgr.offset - drift_adc) < 50.0
+    assert mgr.current_weight == 0.0
+
+    # Nếu > 3.5g (như đặt vật thật 50g) không bao giờ Auto-Zero dù ở IDLE > 3.0s
+    old_offset = mgr.offset
+    assert mgr._track_auto_zero_drift(old_offset + 50.0 * mgr.scale_ratio, 50.0, 300.0) is False
+    assert mgr._track_auto_zero_drift(old_offset + 50.0 * mgr.scale_ratio, 50.0, 305.0) is False
+    assert mgr.offset == old_offset
+
+    # 2. Kiểm tra _init_gpio chờ >= 0.5s và gọi tare(samples=21)
+    calls: dict[str, object] = {"sleeps": [], "tare_samples": None}
+
+    class _FakeGPIO:
+        BCM = 11
+        OUT = 0
+        IN = 1
+
+        @staticmethod
+        def setwarnings(_):
+            pass
+
+        @staticmethod
+        def setmode(_):
+            pass
+
+        @staticmethod
+        def setup(*_):
+            pass
+
+        @staticmethod
+        def output(*_):
+            pass
+
+    orig_gpio, orig_has, orig_sleep = lc_mod.GPIO, lc_mod.HAS_RPI_GPIO, lc_mod.time.sleep
+    try:
+        lc_mod.GPIO = _FakeGPIO
+        lc_mod.HAS_RPI_GPIO = True
+        lc_mod.time.sleep = lambda s: calls["sleeps"].append(s)
+
+        mgr.sck_pin = 6
+        mgr.dt_pin = 5
+        mgr.invert_signal = True
+        mgr.tare = lambda samples=21: (calls.__setitem__("tare_samples", samples) or True)
+        mgr._init_gpio()
+        assert 0.5 in calls["sleeps"]
+        assert calls["tare_samples"] == 21
+    finally:
+        lc_mod.GPIO = orig_gpio
+        lc_mod.HAS_RPI_GPIO = orig_has
+        lc_mod.time.sleep = orig_sleep
+
+
 def test_enterprise_kitchen_e2e_workflow():
     cal_path = ROOT_DIR / "hardware" / "calibration.json"
     cal_backup = cal_path.read_text(encoding="utf-8") if cal_path.exists() else None
@@ -228,6 +315,13 @@ def _run_e2e_test_body():
         log2_id = next(i["log_id"] for i in d2_ord["items"] if i["id"] == tomato_item["id"])
 
         # 6. Báo cáo, Export CSV/XLSX & Calibration (Admin)
+        # Kiểm tra nút Tare / Về 0g đặt nắp nhôm (230g) -> đưa ngay về 0.0g & IDLE
+        client.post("/api/station/simulate/weight", json={"weight_gram": 230.0})
+        r_tare = client.post("/api/station/tare")
+        assert r_tare.status_code == 200
+        assert r_tare.json()["weight_gram"] == 0.0
+        assert r_tare.json()["snapshot"]["state"] == "IDLE"
+
         r_csv = client.get("/api/reports/export.csv")
         assert r_csv.status_code == 200
         assert "Cà chua chín" in r_csv.content.decode("utf-8")

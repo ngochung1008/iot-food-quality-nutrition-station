@@ -52,24 +52,32 @@ export class LoginPage {
             <div class="demo-account-grid">
               <button type="button" class="demo-btn" data-user="admin" data-pass="admin123">
                 <div>
-                  <div style="font-weight:700; font-size:16px; color:var(--text-primary);">Quản trị viên (Admin)</div>
-                  <div style="font-size:14px; color:var(--text-muted);">admin / admin123 — Toàn quyền báo cáo, nhân sự, hiệu chuẩn</div>
+                  <div style="font-weight:700; font-size:16px; color:var(--text-primary);">Đặng Nguyễn Hữu Huy</div>
+                  <div style="font-size:14px; color:var(--text-muted);">admin / admin123 — Quản trị viên (Toàn quyền báo cáo, nhân sự, hiệu chuẩn)</div>
                 </div>
                 <span class="badge badge-success">ADMIN</span>
               </button>
 
               <button type="button" class="demo-btn" data-user="chef" data-pass="chef123">
                 <div>
-                  <div style="font-weight:700; font-size:16px; color:var(--text-primary);">Đầu bếp trưởng (Chef)</div>
-                  <div style="font-size:14px; color:var(--text-muted);">chef / chef123 — Lập thực đơn, tính Calo, đẩy phiếu nguyên liệu</div>
+                  <div style="font-weight:700; font-size:16px; color:var(--text-primary);">Phạm Hữu Tuân</div>
+                  <div style="font-size:14px; color:var(--text-muted);">chef / chef123 — Đầu bếp trưởng (Lập thực đơn, tính Calo, đẩy phiếu nguyên liệu)</div>
                 </div>
                 <span class="badge badge-info">CHEF</span>
               </button>
 
-              <button type="button" class="demo-btn" data-user="receiver" data-pass="receiver123">
+              <button type="button" class="demo-btn" data-user="khiem" data-pass="receiver123">
                 <div>
-                  <div style="font-weight:700; font-size:16px; color:var(--text-primary);">Nhân viên tiếp nhận &amp; QC</div>
-                  <div style="font-size:14px; color:var(--text-muted);">receiver / receiver123 — Vận hành trạm cân Pi 4, kiểm định &amp; tích xanh</div>
+                  <div style="font-weight:700; font-size:16px; color:var(--text-primary);">Nguyễn Chánh Khiêm</div>
+                  <div style="font-size:14px; color:var(--text-muted);">khiem (hoặc receiver) / receiver123 — Nhân viên tiếp nhận &amp; QC (Trạm cân Pi 4)</div>
+                </div>
+                <span class="badge badge-warning">RECEIVER</span>
+              </button>
+
+              <button type="button" class="demo-btn" data-user="hung" data-pass="receiver123">
+                <div>
+                  <div style="font-weight:700; font-size:16px; color:var(--text-primary);">Phạm Ngọc Hưng</div>
+                  <div style="font-size:14px; color:var(--text-muted);">hung / receiver123 — Nhân viên tiếp nhận &amp; QC (Trạm cân Pi 4)</div>
                 </div>
                 <span class="badge badge-warning">RECEIVER</span>
               </button>

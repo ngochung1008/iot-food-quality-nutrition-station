@@ -59,8 +59,7 @@ body {
 
 /* Top Navigation */
 .topbar {
-  position: sticky;
-  top: 0;
+  position: static;
   z-index: 40;
   background: #FFFFFF;
   border-bottom: 1px solid var(--border);
