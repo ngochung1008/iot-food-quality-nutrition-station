@@ -60,7 +60,7 @@ class LoadcellManager:
         self._io_lock = threading.RLock()
         self._raw_cond = threading.Condition(self._lock)
         self.offset: float = 0.0
-        self.scale_ratio: float = -326.1189
+        self.scale_ratio: float = -392.25
         self.calibrated: bool = False
 
         self.last_grams: float = 0.0
@@ -80,6 +80,7 @@ class LoadcellManager:
         self._spike_skip_count: int = 0
         self._bitshift_skip_count: int = 0
         self._step_jump_count: int = 0
+        self._consecutive_timeouts: int = 0
         self._stable_since: float | None = None
         self._drift_since: float | None = None
         self._drift_raw_samples: deque[float] = deque(maxlen=40)
@@ -140,13 +141,13 @@ class LoadcellManager:
     def load_calibration(self) -> None:
         """Đọc scale_ratio và tare_offset từ hardware/calibration.json.
 
-        Nếu chưa có file calibration.json, dùng mặc định -326.1189 cho Loadcell 5kg.
+        Nếu chưa có file calibration.json, dùng mặc định -392.25 cho Loadcell 5kg.
         Tuyệt đối không tự ý ghi đè scale_ratio nếu file calibration.json đã tồn tại.
         """
         cal_file = settings.calibration_file
         if not cal_file.exists():
             self.calibrated = False
-            self.scale_ratio = -326.1189
+            self.scale_ratio = -392.25
             self.last_error = f"Chưa tìm thấy {cal_file.name}, cần hiệu chuẩn cân."
             logger.warning(f"[LOADCELL] {self.last_error}")
             return
@@ -227,6 +228,19 @@ class LoadcellManager:
             return False
         return GPIO.input(self.dt_pin) == 0
 
+    def _reset_hx711(self) -> None:
+        """Reset phần cứng chip HX711 bằng xung SCK HIGH 100µs rồi hạ LOW để tự phục hồi."""
+        if not HAS_RPI_GPIO or GPIO is None or not self.hardware_available:
+            return
+        try:
+            GPIO.output(self.sck_pin, True)
+            time.sleep(0.0001)
+            GPIO.output(self.sck_pin, False)
+            time.sleep(0.005)
+            logger.warning("[LOADCELL] Đã reset HX711 (SCK HIGH 100µs -> LOW) sau 3 lần Timeout DOUT.")
+        except Exception as exc:
+            logger.debug(f"[LOADCELL] Lỗi _reset_hx711(): {exc}")
+
     def read_raw(self) -> int | None:
         """Đọc 24-bit nhị phân từ HX711 kèm xung thứ 25; trả None nếu bị ngắt > 12ms hoặc mẫu lỗi."""
         if self.mock_mode:
@@ -240,7 +254,12 @@ class LoadcellManager:
             time.sleep(0.001)
             timeout += 0.001
             if timeout > 0.3:
+                self._consecutive_timeouts = getattr(self, "_consecutive_timeouts", 0) + 1
+                if self._consecutive_timeouts >= 3:
+                    self._consecutive_timeouts = 0
+                    self._reset_hx711()
                 raise TimeoutError("HX711 không phản hồi (Timeout DOUT > 0.3s).")
+        self._consecutive_timeouts = 0
 
         t_start = time.perf_counter()
         count = 0
@@ -451,12 +470,12 @@ class LoadcellManager:
             return False
 
     def calibrate_with_known_weight(self, known_weight_g: float, invert_if_negative: bool = True) -> dict[str, Any]:
-        """Thực hiện bước 2 hiệu chuẩn cân: lấy 15 mẫu từ bộ đệm _reader_loop và kiểm tra khóa an toàn."""
+        """Thực hiện bước 2 hiệu chuẩn cân: lấy 8 mẫu từ bộ đệm _reader_loop và kiểm tra khóa an toàn."""
         if known_weight_g <= 0:
             return {"ok": False, "error": "Khối lượng chuẩn phải lớn hơn 0g."}
 
         try:
-            raw_loaded = self.read_trimmed_median_raw(samples=15, timeout_s=3.0)
+            raw_loaded = self.read_trimmed_median_raw(samples=8, timeout_s=3.0)
             if self.mock_mode:
                 # Ở chế độ mock, giả lập delta hợp lý theo vật mẫu để test quy trình calibration UI
                 diff = known_weight_g * self.scale_ratio
@@ -567,7 +586,7 @@ class LoadcellManager:
 
     def _raw_to_unclamped_grams(self, raw_adc: float) -> float:
         if self.mock_mode:
-            ratio = self._mock_driver.scale_ratio if self._mock_driver.scale_ratio != 0 else -326.1189
+            ratio = self._mock_driver.scale_ratio if self._mock_driver.scale_ratio != 0 else -392.25
             return max(0.0, (raw_adc - self._mock_driver.offset) / ratio)
         if self.scale_ratio == 0:
             return 0.0

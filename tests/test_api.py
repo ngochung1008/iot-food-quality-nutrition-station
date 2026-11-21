@@ -160,7 +160,7 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
 
     mgr_buf = object.__new__(lc_mod.LoadcellManager)
     mgr_buf.mock_mode = False
-    mgr_buf.scale_ratio = -326.1189
+    mgr_buf.scale_ratio = -392.25
     mgr_buf.offset = 10000.0
     mgr_buf.calibrated = False
     mgr_buf._lock = threading.Lock()
@@ -170,12 +170,12 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
     mgr_buf.last_raw_timestamp = 0.0
     mgr_buf._reader_thread = threading.Thread(target=lambda: None)
 
-    # Giả lập _reader_loop đang chạy đẩy 15 mẫu thô mới vào _raw_buffer (calibrate không gọi read_raw())
+    # Giả lập _reader_loop đang chạy đẩy 8+ mẫu thô mới vào _raw_buffer (calibrate không gọi read_raw())
     mgr_buf.read_raw = lambda: (_ for _ in ()).throw(AssertionError("Không được gọi read_raw() trực tiếp!"))
     mgr_buf._reader_thread.is_alive = lambda: True
 
     def _producer_stub(base_raw):
-        for i in range(18):
+        for i in range(10):
             _t.sleep(0.005)
             with mgr_buf._raw_cond:
                 now = _t.time()
@@ -184,14 +184,14 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
                 mgr_buf.last_raw_timestamp = now
                 mgr_buf._raw_cond.notify_all()
 
-    # Trường hợp lỗi 1: diff quá nhỏ (< 3000) -> bị từ chối, giữ nguyên -326.1189
+    # Trường hợp lỗi 1: diff quá nhỏ (< 3000) -> bị từ chối, giữ nguyên -392.25
     t1 = threading.Thread(target=_producer_stub, args=(10500.0,))
     t1.start()
     res_small = mgr_buf.calibrate_with_known_weight(500.0)
     t1.join()
     assert res_small["ok"] is False
     assert "Tín hiệu cảm biến chưa ổn định" in res_small["error"]
-    assert mgr_buf.scale_ratio == -326.1189
+    assert mgr_buf.scale_ratio == -392.25
 
     # Trường hợp lỗi 2: diff >= 3000 nhưng tạo scale_ratio rác = 7.7778 (< 150) -> bị từ chối!
     t2 = threading.Thread(target=_producer_stub, args=(13888.9,))  # diff=3888.9 / 500 = 7.7778
@@ -200,7 +200,47 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
     t2.join()
     assert res_bad_ratio["ok"] is False
     assert "Tín hiệu cảm biến chưa ổn định" in res_bad_ratio["error"]
-    assert mgr_buf.scale_ratio == -326.1189
+    assert mgr_buf.scale_ratio == -392.25
+
+    # 4b. Kiểm tra _reset_hx711() tự động chạy khi Timeout DOUT > 0.3s 3 lần liên tiếp
+    sck_ops: list[tuple[int, bool]] = []
+    sleep_ops: list[float] = []
+
+    class _StuckDOUTGPIO:
+        @staticmethod
+        def input(_):
+            return 1  # DOUT luôn HIGH -> ép TimeoutError > 0.3s
+
+        @staticmethod
+        def output(pin, val):
+            sck_ops.append((pin, bool(val)))
+
+    mgr_to = object.__new__(lc_mod.LoadcellManager)
+    mgr_to.mock_mode = False
+    mgr_to.hardware_available = True
+    mgr_to.sck_pin = 6
+    mgr_to.dt_pin = 5
+    mgr_to._consecutive_timeouts = 0
+    orig_gpio2, orig_has2, orig_sleep2 = lc_mod.GPIO, lc_mod.HAS_RPI_GPIO, lc_mod.time.sleep
+    try:
+        lc_mod.GPIO = _StuckDOUTGPIO
+        lc_mod.HAS_RPI_GPIO = True
+        lc_mod.time.sleep = lambda s: sleep_ops.append(s)
+        for idx in range(3):
+            try:
+                mgr_to.read_raw()
+                raise AssertionError("Phải raise TimeoutError")
+            except TimeoutError:
+                if idx < 2:
+                    assert sck_ops == []
+        # Sau lần timeout thứ 3 -> đã kéo SCK HIGH 100µs rồi hạ LOW
+        assert (6, True) in sck_ops and (6, False) in sck_ops
+        assert 0.0001 in sleep_ops
+        assert mgr_to._consecutive_timeouts == 0
+    finally:
+        lc_mod.GPIO = orig_gpio2
+        lc_mod.HAS_RPI_GPIO = orig_has2
+        lc_mod.time.sleep = orig_sleep2
 
     # 5. Kiểm tra định dạng LCD 16x2 ASCII cho IDLE, STABILIZING, INSPECTING, CHECKOUT
     lcd = LCDDisplayManager()
