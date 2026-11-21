@@ -914,8 +914,9 @@ def mark_procurement_item_completed(
     checked_by: str,
     log_id: str,
     image_url: str | None = None,
+    accumulate: bool = False,
 ) -> dict[str, Any]:
-    """Đánh dấu TÍCH XANH nguyên liệu trong phiếu và tự động hoàn tất đơn hàng khi đủ 100%."""
+    """Đánh dấu TÍCH XANH nguyên liệu trong phiếu: chỉ ghi đè khi chưa COMPLETED, chỉ cộng dồn khi accumulate=True và đã COMPLETED."""
     now = utc_now_iso()
     with get_db_conn() as conn:
         item_row = conn.execute(
@@ -924,6 +925,14 @@ def mark_procurement_item_completed(
         ).fetchone()
         if not item_row:
             raise ValueError("Không tìm thấy dòng nguyên liệu trong phiếu yêu cầu.")
+
+        grams_rounded = round(float(actual_gram), 1)
+        is_checked = item_row["status"] == "COMPLETED"
+        if accumulate and is_checked:
+            new_actual_gram = round(float(item_row["actual_gram"] or 0.0) + grams_rounded, 1)
+        else:
+            # Nếu nguyên liệu chưa hoàn thành (is_checked == False), lấy đúng trọng lượng hiện tại, không cộng dồn nhầm
+            new_actual_gram = grams_rounded
 
         conn.execute(
             """
@@ -934,7 +943,7 @@ def mark_procurement_item_completed(
             WHERE id = ?
             """,
             (
-                round(actual_gram, 1), quality_status, round(confidence, 3),
+                new_actual_gram, quality_status, round(confidence, 3),
                 checked_by, now, log_id, image_url or "", item_id,
             ),
         )

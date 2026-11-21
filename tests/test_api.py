@@ -644,6 +644,47 @@ def _run_e2e_test_body():
         assert ap_res["item"]["class_name"] == "Carrot"
         assert ap_res["item"]["status"] == "PENDING"
         assert ap_res["item"]["required_gram"] == 500.0
+        carrot_item_id = ap_res["item"]["id"]
+
+        # Kiểm tra không cộng dồn khi PENDING (dù trước đó có số dư 123g) & chỉ ghi 1 lần/phiên cho tới IDLE
+        from backend.database.crud import mark_procurement_item_completed
+        from backend.database.models import get_db_conn
+
+        with get_db_conn() as conn:
+            conn.execute("UPDATE procurement_items SET actual_gram = 123.0 WHERE id = ?", (carrot_item_id,))
+
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/simulate/weight", json={"weight_gram": 510.0})
+        r_c1 = client.post("/api/station/inspect", json={"override_label": "Carrot", "override_quality": "FRESH"})
+        assert r_c1.status_code == 200
+        # Lần tự động khớp khi chưa COMPLETED -> lấy đúng ~510g, KHÔNG thành 123 + 510 = 633g
+        ord_after_carrot = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        carrot_row = next(i for i in ord_after_carrot["items"] if i["id"] == carrot_item_id)
+        assert 500.0 <= carrot_row["actual_gram"] <= 520.0
+        carrot_log_id = carrot_row["log_id"]
+
+        # Trong cùng phiên CHECKOUT (chưa nhấc về IDLE), gọi lại run_inspection không được ghi lặp lần 2
+        from backend.services.station_service import station_service
+
+        assert station_service.state_machine._session_committed is True
+        station_service.state_machine.run_inspection(weight_gram=515.0, override_label="Carrot", override_quality="FRESH")
+        ord_same_sess = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        carrot_row_same = next(i for i in ord_same_sess["items"] if i["id"] == carrot_item_id)
+        assert carrot_row_same["actual_gram"] == carrot_row["actual_gram"]
+
+        # Khi đã COMPLETED và nhân viên chủ động bấm xác nhận thêm lô (accumulate=True) -> mới cộng dồn
+        acc_ord = mark_procurement_item_completed(
+            order_id=order_id,
+            item_id=carrot_item_id,
+            actual_gram=200.0,
+            quality_status="FRESH",
+            confidence=0.95,
+            checked_by="receiver",
+            log_id=carrot_log_id,
+            accumulate=True,
+        )
+        carrot_acc = next(i for i in acc_ord["items"] if i["id"] == carrot_item_id)
+        assert round(carrot_acc["actual_gram"], 1) == round(carrot_row["actual_gram"] + 200.0, 1)
 
         # 6. Báo cáo, Export CSV/XLSX & Calibration (Admin)
         # Kiểm tra nút Tare / Về 0g đặt nắp nhôm (230g) -> đưa ngay về 0.0g & IDLE
@@ -682,4 +723,5 @@ def _run_e2e_test_body():
         client.delete(f"/api/logs/{log1_id}", headers=admin_hdr)
         client.delete(f"/api/logs/{log2_id}", headers=admin_hdr)
         client.delete(f"/api/logs/{extra_log_id}", headers=admin_hdr)
+        client.delete(f"/api/logs/{carrot_log_id}", headers=admin_hdr)
         client.delete(f"/api/kitchen/dishes/{dish_id}", headers=chef_hdr)

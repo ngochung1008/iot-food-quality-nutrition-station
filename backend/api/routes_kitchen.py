@@ -142,6 +142,7 @@ def check_and_complete_order_item(
             confirmed_by=user.get("full_name", user.get("username", "receiver")),
             order_id=order_id,
             order_item_id=body.item_id,
+            accumulate=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

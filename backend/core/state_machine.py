@@ -39,6 +39,7 @@ class NutritionStationStateMachine:
         self.active_order_id: str | None = None
         self.current_inspection: dict[str, Any] | None = None
         self.last_committed_receipt: dict[str, Any] | None = None
+        self._session_committed: bool = False
         self._below_idle_count: int = 0
         self._last_lcd_state: str = ""
         self._last_lcd_weight: float = -999.0
@@ -87,6 +88,7 @@ class NutritionStationStateMachine:
         with self._lock:
             self.state = StationState.IDLE
             self.current_inspection = None
+            self._session_committed = False
             self._below_idle_count = 0
             self.scale.station_state = self.state.value
             if hasattr(self.scale, "reset_stability"):
@@ -97,6 +99,11 @@ class NutritionStationStateMachine:
         self._emit("state_change", snap)
         return snap
 
+    def mark_session_committed(self) -> None:
+        """Đánh dấu phiên đặt vật hiện tại đã ghi nhận vào phiếu/CSDL đúng 1 lần cho tới khi về IDLE."""
+        with self._lock:
+            self._session_committed = True
+
     def reset_after_tare(self) -> dict[str, Any]:
         """Đưa ngay State Machine về IDLE sau khi người dùng bấm Tare / Về 0g."""
         return self.reset_session()
@@ -105,6 +112,7 @@ class NutritionStationStateMachine:
         """Reset sạch phiên cân & xóa bounding box khi đĩa cân trống (< idle_weight_g)."""
         self.state = StationState.IDLE
         self.current_inspection = None
+        self._session_committed = False
         self._below_idle_count = 0
         if self.camera:
             self.camera.set_overlay_detections([])
@@ -307,6 +315,7 @@ class NutritionStationStateMachine:
             if w >= settings.idle_weight_g:
                 self.state = StationState.CHECKOUT
             target_order_id = self.active_order_id
+            already_committed_in_session = self._session_committed
 
         if self.lcd:
             self.lcd.display_station_status(
@@ -322,9 +331,10 @@ class NutritionStationStateMachine:
             self._last_lcd_weight = w
             self._last_lcd_update_ts = time.time()
 
-        # Tự động đối chiếu & TÍCH XANH vào Phiếu Yêu Cầu Nguyên Liệu đang hoạt động nếu khớp loại + đạt >= 95%
+        # Tự động đối chiếu & TÍCH XANH vào Phiếu Yêu Cầu Nguyên Liệu (chỉ ghi 1 lần/phiên cho tới khi về IDLE)
         auto_checked = False
-        if target_order_id and w >= settings.detect_weight_g and quality.get("status") != "REJECTED":
+        allow_auto_record = (not already_committed_in_session) or (override_label is not None and weight_gram is None)
+        if allow_auto_record and target_order_id and w >= settings.detect_weight_g and quality.get("status") != "REJECTED":
             from backend.database.crud import get_procurement_order
             from backend.services.station_service import station_service
 
@@ -334,7 +344,7 @@ class NutritionStationStateMachine:
                     (
                         it
                         for it in order["items"]
-                        if it["status"] == "PENDING"
+                        if it["status"] != "COMPLETED"
                         and it["class_name"].lower() == nutrition["class_name"].lower()
                         and w >= float(it["min_acceptable_gram"])
                     ),
@@ -347,12 +357,20 @@ class NutritionStationStateMachine:
                             order_item_id=matched_item["id"],
                             confirmed_by="Trạm cân AI (Tự động tích xanh)",
                             note="Tự động đối chiếu đạt chuẩn >= 95%",
+                            accumulate=False,
                         )
                         auto_checked = True
+                        with self._lock:
+                            self._session_committed = True
                     except Exception as exc:
                         logger.warning(f"[STATE] Auto tích xanh bỏ qua: {exc}")
 
-        if not auto_checked and self.auto_commit and w >= settings.idle_weight_g:
+        if allow_auto_record and not auto_checked and self.auto_commit and w >= settings.idle_weight_g:
+            from backend.services.station_service import station_service
+
+            station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định", accumulate=False)
+            with self._lock:
+                self._session_committed = True
             from backend.services.station_service import station_service
 
             station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định")

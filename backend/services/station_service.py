@@ -214,6 +214,7 @@ class StationService:
         confirmed_by: str = "Nhân viên bếp",
         order_id: str | None = None,
         order_item_id: str | None = None,
+        accumulate: bool = False,
     ) -> dict[str, Any]:
         """Chốt đơn / Lưu phiếu tiếp nhận vào SQLite (hỗ trợ đối chiếu Phiếu Yêu Cầu Nguyên Liệu)."""
         assert self.state_machine and self.scale
@@ -298,6 +299,7 @@ class StationService:
         insert_intake_log(receipt)
         insp["committed"] = True
         self.state_machine.last_committed_receipt = receipt
+        self.state_machine.mark_session_committed()
 
         if order_id and order_item_id:
             updated_order = mark_procurement_item_completed(
@@ -309,6 +311,7 @@ class StationService:
                 checked_by=confirmed_by,
                 log_id=receipt["id"],
                 image_url=insp.get("image_url"),
+                accumulate=accumulate,
             )
             self._on_station_event("order_updated", {"order": updated_order})
 
