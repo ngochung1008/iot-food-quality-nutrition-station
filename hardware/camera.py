@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -72,47 +73,80 @@ class CameraManager:
 
         self._initialized = True
 
-    def _open_capture(self) -> bool:
-        """Mở USB Camera thực tế với V4L2 trên Raspberry Pi hoặc mặc định trên PC."""
-        self._close_capture()
-        candidates: list[int | str] = [self.camera_index]
-        if self.device_path and os.name != "nt" and self.device_path not in candidates:
-            candidates.append(self.device_path)
-        for alt in (0, 1):
-            if alt not in candidates:
-                candidates.append(alt)
+    def _try_open_source(self, src: int | str, use_v4l2: bool) -> bool:
+        """Mở nguồn Camera với MJPG/640x480/BUFFERSIZE=1 và chờ tối đa 1.5s lấy frame đầu."""
+        cap = None
+        try:
+            if use_v4l2 and hasattr(cv2, "CAP_V4L2"):
+                cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
+            else:
+                cap = cv2.VideoCapture(src)
 
-        for src in candidates:
-            try:
-                cap = None
-                if hasattr(cv2, "CAP_V4L2") and os.name != "nt":
-                    cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
-                if cap is None or not cap.isOpened():
-                    cap = cv2.VideoCapture(src)
-
-                if cap is not None and cap.isOpened():
-                    try:
-                        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*settings.camera_fourcc))
-                    except Exception:
-                        pass
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
-                    cap.set(cv2.CAP_PROP_FPS, float(self.fps))
-                    try:
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, float(self.buffersize))
-                    except Exception:
-                        pass
-
-                    ok, test_frame = cap.read()
-                    if ok and test_frame is not None and test_frame.size > 0:
-                        self._cap = cap
-                        self.hardware_available = True
-                        self._consecutive_errors = 0
-                        logger.info(f"[CAMERA] Đã kết nối Camera nguồn {src} ({self.width}x{self.height}@{self.fps}fps)")
-                        return True
+            if cap is None or not cap.isOpened():
+                if cap is not None:
                     cap.release()
-            except Exception as exc:
-                logger.debug(f"[CAMERA] Không mở được nguồn {src}: {exc}")
+                return False
+
+            try:
+                fourcc = settings.camera_fourcc or "MJPG"
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+            except Exception:
+                pass
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+            cap.set(cv2.CAP_PROP_FPS, float(self.fps))
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1.0)
+            except Exception:
+                pass
+
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                ok, test_frame = cap.read()
+                if ok and test_frame is not None and test_frame.size > 0:
+                    self._cap = cap
+                    self.hardware_available = True
+                    self._consecutive_errors = 0
+                    logger.info(
+                        f"[CAMERA] Đã kết nối Camera nguồn {src} ({self.width}x{self.height}@{self.fps}fps, MJPG)"
+                    )
+                    return True
+                time.sleep(0.05)
+
+            cap.release()
+            return False
+        except Exception as exc:
+            logger.debug(f"[CAMERA] Lỗi mở nguồn {src}: {exc}")
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            return False
+
+    def _open_capture(self) -> bool:
+        """Mở USB Camera trên Raspberry Pi 4 (trực tiếp index 0 + CAP_V4L2, không quét /dev/video1)."""
+        self._close_capture()
+        is_linux = sys.platform.startswith("linux")
+
+        if is_linux:
+            # Trên Pi 4 mở trực tiếp index 0 (hoặc camera_index khác 1), tuyệt đối không quét sang /dev/video1
+            target_idx = 0 if self.camera_index == 1 else int(self.camera_index)
+            for attempt in range(2):
+                if self._try_open_source(target_idx, use_v4l2=True):
+                    return True
+                if attempt == 0:
+                    logger.warning(
+                        f"[CAMERA] Chưa đọc được frame từ /dev/video{target_idx} sau 1.5s, thử mở lại sau 0.3s..."
+                    )
+                    time.sleep(0.3)
+        else:
+            candidates: list[int | str] = [self.camera_index]
+            if 0 not in candidates:
+                candidates.append(0)
+            for src in candidates:
+                if self._try_open_source(src, use_v4l2=False):
+                    return True
 
         self._cap = None
         self.hardware_available = False

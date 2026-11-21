@@ -8,6 +8,7 @@ metadata.yaml
 # Biến môi trường & cấu hình cục bộ
 .env
 .env.local
+hardware/calibration.json
 
 # Python artifacts
 __pycache__/

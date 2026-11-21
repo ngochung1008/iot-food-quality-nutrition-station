@@ -141,16 +141,29 @@ class LoadcellManager:
     def load_calibration(self) -> None:
         """Đọc scale_ratio và tare_offset từ hardware/calibration.json.
 
-        Nếu chưa có file calibration.json, dùng mặc định -392.25 cho Loadcell 5kg.
-        Tuyệt đối không tự ý ghi đè scale_ratio nếu file calibration.json đã tồn tại.
+        Nếu chưa có file calibration.json trên máy mới, tự động khởi tạo từ
+        hardware/calibration.example.json (scale_ratio = -392.25).
+        Tuyệt đối không tự ý ghi đè calibration.json nếu file đã tồn tại.
         """
         cal_file = settings.calibration_file
+        example_file = cal_file.with_name("calibration.example.json")
         if not cal_file.exists():
-            self.calibrated = False
-            self.scale_ratio = -392.25
-            self.last_error = f"Chưa tìm thấy {cal_file.name}, cần hiệu chuẩn cân."
-            logger.warning(f"[LOADCELL] {self.last_error}")
-            return
+            if example_file.exists():
+                try:
+                    cal_file.parent.mkdir(parents=True, exist_ok=True)
+                    cal_file.write_text(example_file.read_text(encoding="utf-8"), encoding="utf-8")
+                    logger.info(
+                        f"[LOADCELL] Đã khởi tạo {cal_file.name} từ {example_file.name}."
+                    )
+                except Exception as exc:
+                    logger.warning(f"[LOADCELL] Không thể sao chép {example_file.name}: {exc}")
+
+            if not cal_file.exists():
+                self.calibrated = False
+                self.scale_ratio = -392.25
+                self.last_error = f"Chưa tìm thấy {cal_file.name}, cần hiệu chuẩn cân."
+                logger.warning(f"[LOADCELL] {self.last_error}")
+                return
 
         try:
             with open(cal_file, "r", encoding="utf-8-sig") as f:

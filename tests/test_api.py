@@ -242,6 +242,92 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
         lc_mod.HAS_RPI_GPIO = orig_has2
         lc_mod.time.sleep = orig_sleep2
 
+    # 4c. Kiểm tra khởi tạo calibration.json từ calibration.example.json khi chưa có file
+    import tempfile
+    from backend.core import config as cfg_mod
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_dir = Path(tmpdir)
+        ex_file = tmp_dir / "calibration.example.json"
+        ex_file.write_text('{"scale_ratio": -392.25, "tare_offset": 90068.0}\n', encoding="utf-8")
+        cal_tmp = tmp_dir / "calibration.json"
+
+        orig_cal = cfg_mod.settings.calibration_file
+        object.__setattr__(cfg_mod.settings, "calibration_file", cal_tmp)
+        try:
+            mgr_cal = object.__new__(lc_mod.LoadcellManager)
+            mgr_cal.offset = 0.0
+            mgr_cal.scale_ratio = 0.0
+            mgr_cal.calibrated = False
+            mgr_cal.load_calibration()
+            assert cal_tmp.exists()
+            assert mgr_cal.calibrated is True
+            assert mgr_cal.scale_ratio == -392.25
+            assert mgr_cal.offset == 90068.0
+        finally:
+            object.__setattr__(cfg_mod.settings, "calibration_file", orig_cal)
+
+    # 4d. Kiểm tra CameraManager trên Linux: chỉ mở index 0 với CAP_V4L2 (không mở 1), retry 1 lần sau 0.3s
+    import hardware.camera as cam_mod
+
+    opened_calls: list[tuple] = []
+
+    class _FakeCap:
+        def __init__(self, idx):
+            self.idx = idx
+            self.props = {}
+
+        def isOpened(self):
+            return True
+
+        def set(self, prop, val):
+            self.props[prop] = val
+
+        def read(self):
+            # Lần mở đầu thất bại hết 1.5s, lần mở thứ 2 trả frame hợp lệ
+            if len(opened_calls) == 1:
+                return False, None
+            import numpy as _np
+            return True, _np.zeros((480, 640, 3), dtype=_np.uint8)
+
+        def release(self):
+            pass
+
+    cam_obj = object.__new__(cam_mod.CameraManager)
+    cam_obj.mock_mode = False
+    cam_obj.camera_index = 0
+    cam_obj.device_path = "/dev/video0"
+    cam_obj.width = 640
+    cam_obj.height = 480
+    cam_obj.fps = 30
+    cam_obj.buffersize = 1
+    cam_obj._cap = None
+    cam_obj.hardware_available = False
+    cam_obj._consecutive_errors = 0
+
+    orig_plat, orig_vc, orig_mono = cam_mod.sys.platform, cam_mod.cv2.VideoCapture, cam_mod.time.monotonic
+    orig_cam_sleep = cam_mod.time.sleep
+    mono_tick = {"t": 0.0}
+
+    def _fake_mono():
+        mono_tick["t"] += 0.8
+        return mono_tick["t"]
+
+    try:
+        cam_mod.sys.platform = "linux"
+        cam_mod.time.monotonic = _fake_mono
+        cam_mod.time.sleep = lambda _: None
+        cam_mod.cv2.VideoCapture = lambda src, *args: (opened_calls.append((src, args)) or _FakeCap(src))
+        assert cam_obj._open_capture() is True
+        assert all(call[0] == 0 for call in opened_calls)
+        assert len(opened_calls) == 2
+        assert cam_obj.hardware_available is True
+    finally:
+        cam_mod.sys.platform = orig_plat
+        cam_mod.cv2.VideoCapture = orig_vc
+        cam_mod.time.monotonic = orig_mono
+        cam_mod.time.sleep = orig_cam_sleep
+
     # 5. Kiểm tra định dạng LCD 16x2 ASCII cho IDLE, STABILIZING, INSPECTING, CHECKOUT
     lcd = LCDDisplayManager()
     lcd.display_station_status("IDLE", 0.0)
