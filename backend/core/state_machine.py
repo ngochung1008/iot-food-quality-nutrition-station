@@ -40,6 +40,10 @@ class NutritionStationStateMachine:
         self.current_inspection: dict[str, Any] | None = None
         self.last_committed_receipt: dict[str, Any] | None = None
         self._below_idle_count: int = 0
+        self._last_lcd_state: str = ""
+        self._last_lcd_weight: float = -999.0
+        self._last_lcd_update_ts: float = 0.0
+        self._last_lcd_batch: str = ""
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         try:
@@ -183,14 +187,32 @@ class NutritionStationStateMachine:
                         self.state = StationState.CHECKOUT
                 self._emit("state_change", self.snapshot())
 
-        # Cập nhật LCD 16x2 (hiển thị tên thực phẩm + khối lượng nếu đã có kết quả nhận diện)
+        # Cập nhật LCD 16x2 real-time (ngay khi đổi trạng thái hoặc mỗi 0.5s nếu khối lượng đổi >= 1.0g)
         if self.lcd:
+            now_lcd = time.time()
             insp = self.current_inspection
             food_name = insp["nutrition"]["vietnamese_name"] if insp else None
             kcal = insp["nutrition"]["actual"]["energy_kcal"] if insp else None
             qual = insp["quality"]["status"] if insp else None
+            conf_val = insp.get("confidence") if insp else None
+            batch_code = insp.get("batch_code", "") if insp else ""
             display_state = StationState.CHECKOUT.value if (insp and self.state == StationState.IDLE) else self.state.value
-            self.lcd.display_station_status(display_state, w, food_name=food_name, kcal=kcal, quality_status=qual)
+
+            state_changed = display_state != self._last_lcd_state or batch_code != self._last_lcd_batch
+            weight_changed = abs(w - self._last_lcd_weight) >= 1.0 and (now_lcd - self._last_lcd_update_ts) >= 0.5
+            if state_changed or weight_changed:
+                self.lcd.display_station_status(
+                    display_state,
+                    w,
+                    food_name=food_name,
+                    kcal=kcal,
+                    quality_status=qual,
+                    confidence=conf_val,
+                )
+                self._last_lcd_state = display_state
+                self._last_lcd_batch = batch_code
+                self._last_lcd_weight = w
+                self._last_lcd_update_ts = now_lcd
 
         if (self.state != prev or cleared_to_idle) and not need_inspect:
             self._emit("state_change", self.snapshot())
@@ -293,7 +315,12 @@ class NutritionStationStateMachine:
                 food_name=nutrition.get("vietnamese_name"),
                 kcal=act.get("energy_kcal"),
                 quality_status=quality.get("status"),
+                confidence=confidence,
             )
+            self._last_lcd_state = StationState.CHECKOUT.value
+            self._last_lcd_batch = batch_code
+            self._last_lcd_weight = w
+            self._last_lcd_update_ts = time.time()
 
         # Tự động đối chiếu & TÍCH XANH vào Phiếu Yêu Cầu Nguyên Liệu đang hoạt động nếu khớp loại + đạt >= 95%
         auto_checked = False

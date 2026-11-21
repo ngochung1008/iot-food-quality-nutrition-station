@@ -160,32 +160,40 @@ class LCDDisplayManager:
         food_name: str | None = None,
         kcal: float | None = None,
         quality_status: str | None = None,
+        confidence: float | None = None,
     ) -> None:
-        """Hiển thị thông tin cân nặng, tên thực phẩm và trạng thái kiểm định lên LCD 16x2."""
+        """Hiển thị thông tin cân nặng, tên thực phẩm và trạng thái kiểm định lên LCD 16x2 (ASCII 16 ký tự)."""
         st = state.upper().strip()
-        w_int = int(round(abs(weight_gram)))
+        grams = max(0.0, float(weight_gram))
 
         if st == "IDLE":
-            l1 = "SAN SANG CAN"
-            l2 = f"{w_int}g - CHO HANG" if w_int > 0 else "DAT THUC PHAM..."
+            l1 = "TRAM CAN SAN SANG"
+            l2 = "0.0g | DAT VAT LEN"
         elif st == "STABILIZING":
-            l1 = "DANG ON DINH..."
-            l2 = f"Trong luong:{w_int}g"
+            l1 = "DANG CAN ON DINH"
+            l2 = f"{grams:.1f}g ..."
         elif st == "INSPECTING":
-            l1 = "DANG NHAN DIEN"
-            l2 = f"{w_int}g - AI CHECK"
+            l1 = "AI DANG KIEM DINH"
+            l2 = f"KL: {grams:.1f}g"
         elif st == "CHECKOUT":
-            name_clean = strip_vietnamese_diacritics(food_name or "THUC PHAM")[:10]
+            name_clean = strip_vietnamese_diacritics(food_name or "THUC PHAM").upper().strip()
             if quality_status == "REJECTED":
-                l1 = f"{name_clean} LOI!"
-                l2 = f"{w_int}g TU CHOI"
+                l1 = f"{name_clean[:11]} LOI"
+            elif confidence is not None and confidence > 0:
+                pct = int(round(confidence * 100.0 if confidence <= 1.0 else confidence))
+                suffix = f" ({pct}%)"
+                l1 = f"{name_clean[: max(1, 16 - len(suffix))]}{suffix}"
             else:
-                kcal_int = int(round(kcal or 0))
-                l1 = f"{name_clean} {w_int}g"
-                l2 = f"{kcal_int}kcal - DAT"
+                l1 = name_clean[:16]
+
+            kcal_int = int(round(kcal or 0))
+            line_detail = f"{grams:.1f}g | {kcal_int}kcal"
+            if len(line_detail) > 16:
+                line_detail = f"{grams:.0f}g|{kcal_int}kcal"
+            l2 = line_detail
         else:
             l1 = st
-            l2 = f"{w_int}g"
+            l2 = f"{grams:.1f}g"
 
         self.write_lines(l1, l2)
 

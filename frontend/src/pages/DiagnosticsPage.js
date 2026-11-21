@@ -101,25 +101,57 @@ export class DiagnosticsPage {
 
   _bindEvents() {
     document.getElementById("btn-cal-tare")?.addEventListener("click", async () => {
+      const btn = document.getElementById("btn-cal-tare");
+      const msgEl = document.getElementById("cal-step1-msg");
+      if (btn) btn.disabled = true;
+      if (msgEl) {
+        msgEl.style.color = "var(--text-secondary)";
+        msgEl.textContent = "Đang lấy mẫu từ luồng cân...";
+      }
       try {
         const res = await apiClient.calibrateTare();
-        document.getElementById("cal-step1-msg").textContent = `${res.message} (offset=${res.offset})`;
+        if (msgEl) {
+          msgEl.style.color = "var(--brand)";
+          msgEl.textContent = `${res.message} (offset=${res.offset})`;
+        }
         this.toast("Bước 1 Tare hoàn tất", "success");
         await this.refreshHardware();
       } catch (e) {
+        if (msgEl) {
+          msgEl.style.color = "var(--danger)";
+          msgEl.textContent = `Lỗi Bước 1: ${e.message}`;
+        }
         this.toast(`Lỗi Bước 1: ${e.message}`, "error");
+      } finally {
+        if (btn) btn.disabled = false;
       }
     });
 
     document.getElementById("btn-cal-measure")?.addEventListener("click", async () => {
+      const btn = document.getElementById("btn-cal-measure");
+      const msgEl = document.getElementById("cal-step2-msg");
       const w = Number(document.getElementById("cal-known-weight")?.value || 0);
+      if (btn) btn.disabled = true;
+      if (msgEl) {
+        msgEl.style.color = "var(--text-secondary)";
+        msgEl.textContent = "Đang lấy mẫu từ luồng cân...";
+      }
       try {
         const res = await apiClient.calibrateMeasure(w, true);
-        document.getElementById("cal-step2-msg").textContent = res.message;
+        if (msgEl) {
+          msgEl.style.color = "var(--success)";
+          msgEl.textContent = res.message;
+        }
         this.toast("Hiệu chuẩn cân thành công", "success");
         await this.refreshHardware();
       } catch (e) {
+        if (msgEl) {
+          msgEl.style.color = "var(--danger)";
+          msgEl.textContent = `Lỗi Bước 2: ${e.message}`;
+        }
         this.toast(`Lỗi hiệu chuẩn: ${e.message}`, "error");
+      } finally {
+        if (btn) btn.disabled = false;
       }
     });
 

@@ -141,6 +141,77 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
     assert snap_idle["latest_inspection"] is None
     assert overlay_history[-1] == []
 
+    # 4. Kiểm tra khóa an toàn scale_ratio (từ chối diff < 3000 & ratio=7.7778), mặc định -326.1189 & bộ đệm luồng đọc
+    import threading
+    import time as _t
+    from hardware.lcd_display import LCDDisplayManager, format_lcd_line
+
+    mgr_buf = object.__new__(lc_mod.LoadcellManager)
+    mgr_buf.mock_mode = False
+    mgr_buf.scale_ratio = -326.1189
+    mgr_buf.offset = 10000.0
+    mgr_buf.calibrated = False
+    mgr_buf._lock = threading.Lock()
+    mgr_buf._raw_cond = threading.Condition(mgr_buf._lock)
+    mgr_buf._raw_buffer = lc_mod.deque(maxlen=30)
+    mgr_buf._raw_seq = 0
+    mgr_buf.last_raw_timestamp = 0.0
+    mgr_buf._reader_thread = threading.Thread(target=lambda: None)
+
+    # Giả lập _reader_loop đang chạy đẩy 15 mẫu thô mới vào _raw_buffer (calibrate không gọi read_raw())
+    mgr_buf.read_raw = lambda: (_ for _ in ()).throw(AssertionError("Không được gọi read_raw() trực tiếp!"))
+    mgr_buf._reader_thread.is_alive = lambda: True
+
+    def _producer_stub(base_raw):
+        for i in range(18):
+            _t.sleep(0.005)
+            with mgr_buf._raw_cond:
+                now = _t.time()
+                mgr_buf._raw_buffer.append((now, base_raw + (i % 3)))
+                mgr_buf._raw_seq += 1
+                mgr_buf.last_raw_timestamp = now
+                mgr_buf._raw_cond.notify_all()
+
+    # Trường hợp lỗi 1: diff quá nhỏ (< 3000) -> bị từ chối, giữ nguyên -326.1189
+    t1 = threading.Thread(target=_producer_stub, args=(10500.0,))
+    t1.start()
+    res_small = mgr_buf.calibrate_with_known_weight(500.0)
+    t1.join()
+    assert res_small["ok"] is False
+    assert "Tín hiệu cảm biến chưa ổn định" in res_small["error"]
+    assert mgr_buf.scale_ratio == -326.1189
+
+    # Trường hợp lỗi 2: diff >= 3000 nhưng tạo scale_ratio rác = 7.7778 (< 150) -> bị từ chối!
+    t2 = threading.Thread(target=_producer_stub, args=(13888.9,))  # diff=3888.9 / 500 = 7.7778
+    t2.start()
+    res_bad_ratio = mgr_buf.calibrate_with_known_weight(500.0)
+    t2.join()
+    assert res_bad_ratio["ok"] is False
+    assert "Tín hiệu cảm biến chưa ổn định" in res_bad_ratio["error"]
+    assert mgr_buf.scale_ratio == -326.1189
+
+    # 5. Kiểm tra định dạng LCD 16x2 ASCII cho IDLE, STABILIZING, INSPECTING, CHECKOUT
+    lcd = LCDDisplayManager()
+    lcd.display_station_status("IDLE", 0.0)
+    st_idle = lcd.get_status()["details"]
+    assert st_idle["line1"] == format_lcd_line("TRAM CAN SAN SANG", 16)
+    assert st_idle["line2"] == format_lcd_line("0.0g | DAT VAT LEN", 16)
+
+    lcd.display_station_status("STABILIZING", 50.4)
+    st_stab = lcd.get_status()["details"]
+    assert st_stab["line1"] == "DANG CAN ON DINH"
+    assert st_stab["line2"].startswith("50.4g ...")
+
+    lcd.display_station_status("INSPECTING", 50.4)
+    st_insp = lcd.get_status()["details"]
+    assert st_insp["line1"].startswith("AI DANG KIEM DIN")
+    assert st_insp["line2"].startswith("KL: 50.4g")
+
+    lcd.display_station_status("CHECKOUT", 50.0, food_name="Trứng gà", kcal=78.0, quality_status="FRESH", confidence=0.70)
+    st_out = lcd.get_status()["details"]
+    assert st_out["line1"].startswith("TRUNG GA (70%)")
+    assert st_out["line2"].startswith("50.0g | 78kcal")
+
 
 def test_loadcell_auto_zero_drift_and_startup_tare():
     """Kiểm tra khởi động _init_gpio (0.5s + tare 21 mẫu) và Auto-Zero Drift Tracking 0.1g..3.5g trong 3.0s."""

@@ -58,8 +58,9 @@ class LoadcellManager:
 
         self._lock = threading.Lock()
         self._io_lock = threading.RLock()
+        self._raw_cond = threading.Condition(self._lock)
         self.offset: float = 0.0
-        self.scale_ratio: float = 420.0
+        self.scale_ratio: float = -326.1189
         self.calibrated: bool = False
 
         self.last_grams: float = 0.0
@@ -68,9 +69,12 @@ class LoadcellManager:
         self.scale_online: bool = False
         self.hardware_available: bool = False
         self.last_sample_time: float = 0.0
+        self.last_raw_timestamp: float = 0.0
         self.last_error: str | None = None
         self.station_state: str = "IDLE"
 
+        self._raw_buffer: deque[tuple[float, float]] = deque(maxlen=30)
+        self._raw_seq: int = 0
         self._history: deque[float] = deque(maxlen=20)
         self._rolling_grams: deque[float] = deque(maxlen=5)
         self._spike_skip_count: int = 0
@@ -135,12 +139,13 @@ class LoadcellManager:
     def load_calibration(self) -> None:
         """Đọc scale_ratio và tare_offset từ hardware/calibration.json.
 
-        Tuyệt đối không tự ý reset scale_ratio về 420.0 nếu file calibration.json đã tồn tại.
+        Nếu chưa có file calibration.json, dùng mặc định -326.1189 cho Loadcell 5kg.
+        Tuyệt đối không tự ý ghi đè scale_ratio nếu file calibration.json đã tồn tại.
         """
         cal_file = settings.calibration_file
         if not cal_file.exists():
             self.calibrated = False
-            self.scale_ratio = 420.0
+            self.scale_ratio = -326.1189
             self.last_error = f"Chưa tìm thấy {cal_file.name}, cần hiệu chuẩn cân."
             logger.warning(f"[LOADCELL] {self.last_error}")
             return
@@ -296,17 +301,29 @@ class LoadcellManager:
                 return float(statistics.median(core))
         return float(statistics.median(sorted_vals))
 
+    def _read_single_raw_hardware(self) -> int | None:
+        """Đọc đúng 1 mẫu 24-bit từ HX711 (chỉ dùng nội bộ trong luồng đọc hoặc lúc khởi tạo)."""
+        with self._io_lock:
+            return self.read_raw()
+
     def _collect_clean_raw_samples(self, samples: int) -> list[int]:
-        """Thu thập N mẫu sạch từ read_raw() (đã kiểm tra t_elapsed <= 12ms và loại mẫu bão hòa)."""
+        """Thu thập N mẫu sạch lúc khởi động trước khi bật luồng nền."""
         values: list[int] = []
         attempts = 0
         max_attempts = max(samples * 3, samples + 12)
         while len(values) < samples and attempts < max_attempts:
             attempts += 1
             try:
-                v = self.read_raw()
+                v = self._read_single_raw_hardware()
                 if v is not None and v not in (0x7FFFFF, -0x800000, -1, 0):
                     values.append(v)
+                    with self._lock:
+                        now = time.time()
+                        self._raw_buffer.append((now, float(v)))
+                        self._raw_seq += 1
+                        self.last_raw_timestamp = now
+                        self.last_sample_time = now
+                        self.scale_online = True
             except TimeoutError:
                 pass
             time.sleep(0.002)
@@ -315,29 +332,75 @@ class LoadcellManager:
             raise RuntimeError("Mất kết nối HX711 (không đọc được mẫu hợp lệ).")
         return values
 
-    def read_median_raw(self, samples: int = 7) -> float:
-        """Đọc N mẫu sạch (mặc định 7), lọc trung vị và loại ngoại lai lệch > ±25% trước khi tính trung bình."""
-        with self._io_lock:
+    def _collect_from_reader_buffer(self, samples: int = 15, timeout_s: float = 3.0) -> list[float]:
+        """Lấy N mẫu thô mới nhất từ bộ đệm vòng của _reader_loop (không đụng GPIO trực tiếp)."""
+        reader = getattr(self, "_reader_thread", None)
+        if reader is None or not reader.is_alive():
             if self.mock_mode:
-                vals = [self._mock_driver.read_raw_simulated() for _ in range(max(3, min(samples, 11)))]
-                return self.filter_median_outliers(vals)
-            values = self._collect_clean_raw_samples(samples)
-            return self.filter_median_outliers(values)
+                return [float(self._mock_driver.read_raw_simulated()) for _ in range(max(4, samples))]
+            return [float(v) for v in self._collect_clean_raw_samples(samples)]
 
-    def read_trimmed_median_raw(self, samples: int = 21) -> float:
-        """Đọc N mẫu sạch, loại 25% đầu & 25% cuối trước khi tính trung vị (dùng cho Tare & Hiệu chuẩn)."""
-        with self._io_lock:
-            if self.mock_mode:
-                vals = [self._mock_driver.read_raw_simulated() for _ in range(max(4, min(samples, 25)))]
-                return self.filter_trimmed_median(vals)
-            values = self._collect_clean_raw_samples(samples)
-            return self.filter_trimmed_median(values)
+        deadline = time.monotonic() + timeout_s
+        collected: list[float] = []
+        with self._raw_cond:
+            last_seen_seq = self._raw_seq
+            while len(collected) < samples:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._raw_seq <= last_seen_seq:
+                    self._raw_cond.wait(timeout=min(remaining, 0.25))
+                    continue
+
+                # Trích xuất các mẫu mới vừa được _reader_loop đẩy vào bộ đệm vòng
+                new_count = min(len(self._raw_buffer), self._raw_seq - last_seen_seq)
+                recent_slice = list(self._raw_buffer)[-new_count:]
+                for _, raw_val in recent_slice:
+                    collected.append(float(raw_val))
+                    if len(collected) >= samples:
+                        break
+                last_seen_seq = self._raw_seq
+
+        if len(collected) >= min(5, samples):
+            return collected
+
+        # Fallback an toàn nếu cân đang giữ ổn định và vừa có mẫu mới < 1.5s
+        with self._lock:
+            now = time.time()
+            if (now - self.last_raw_timestamp) <= 1.5 and len(self._raw_buffer) >= min(5, samples):
+                return [val for _, val in list(self._raw_buffer)[-samples:]]
+
+        raise RuntimeError("Timeout 3.0s chờ mẫu từ luồng đọc HX711 (kiểm tra dây DT/SCK).")
+
+    def read_median_raw(self, samples: int = 7) -> float:
+        """Lấy trung vị loại ngoại lai ±25% (trong HTTP thread chỉ đọc từ bộ đệm vòng)."""
+        if self.mock_mode:
+            vals = [self._mock_driver.read_raw_simulated() for _ in range(max(3, min(samples, 11)))]
+            return self.filter_median_outliers(vals)
+
+        reader = getattr(self, "_reader_thread", None)
+        if reader is not None and reader.is_alive():
+            with self._lock:
+                recent = [val for _, val in list(self._raw_buffer)[-samples:]]
+            if recent:
+                return self.filter_median_outliers(recent)
+
+        values = self._collect_clean_raw_samples(samples)
+        return self.filter_median_outliers(values)
+
+    def read_trimmed_median_raw(self, samples: int = 15, timeout_s: float = 3.0) -> float:
+        """Lấy N mẫu mới nhất từ bộ đệm _reader_loop, bỏ 25% đầu/cuối trước khi tính trung vị."""
+        if self.mock_mode:
+            vals = [self._mock_driver.read_raw_simulated() for _ in range(max(4, min(samples, 25)))]
+            return self.filter_trimmed_median(vals)
+        values = self._collect_from_reader_buffer(samples=samples, timeout_s=timeout_s)
+        return self.filter_trimmed_median(values)
 
     def tare(self, samples: int = 21) -> bool:
-        """Trừ bì (Zero balance): lấy Trimmed Median (bỏ 25% đầu/cuối) của N mẫu sạch làm mốc 0.0g.
+        """Trừ bì (Zero balance): lấy Trimmed Median (bỏ 25% đầu/cuối) từ bộ đệm luồng nền.
 
-        Mặc định trừ bì cả khay/nắp nhôm đi kèm (21 mẫu).
-        Tuyệt đối không ghi đè file hardware/calibration.json nếu đã tồn tại.
+        Mặc định trừ bì cả khay/nắp nhôm đi kèm.
+        Tuyệt đối không gọi read_raw() trực tiếp khi _reader_loop đang chạy để tránh xung đột GPIO.
         """
         if self.mock_mode:
             with self._io_lock:
@@ -361,7 +424,10 @@ class LoadcellManager:
             return False
 
         try:
-            new_offset = self.read_trimmed_median_raw(samples)
+            # Nếu luồng đọc nền đã chạy, lấy 15 mẫu thô mới nhất từ bộ đệm vòng (tối đa 3.0s)
+            reader = getattr(self, "_reader_thread", None)
+            target_samples = min(samples, 15) if (reader is not None and reader.is_alive()) else samples
+            new_offset = self.read_trimmed_median_raw(target_samples, timeout_s=3.0)
             with self._lock:
                 self.offset = new_offset
                 self.last_grams = 0.0
@@ -374,7 +440,7 @@ class LoadcellManager:
                 self._stable_since = None
                 self._drift_since = None
                 self._drift_raw_samples.clear()
-            logger.info(f"[LOADCELL] Đã Tare Trimmed Median {samples} mẫu thành công (tare_offset={self.offset:.1f})")
+            logger.info(f"[LOADCELL] Đã Tare {target_samples} mẫu thành công (tare_offset={self.offset:.1f})")
             return True
         except Exception as exc:
             self.last_error = f"Tare thất bại: {exc}"
@@ -382,27 +448,33 @@ class LoadcellManager:
             return False
 
     def calibrate_with_known_weight(self, known_weight_g: float, invert_if_negative: bool = True) -> dict[str, Any]:
-        """Thực hiện bước 2 hiệu chuẩn cân: đo vật chuẩn (Trimmed Median 25 mẫu) và lưu scale_ratio."""
+        """Thực hiện bước 2 hiệu chuẩn cân: lấy 15 mẫu từ bộ đệm _reader_loop và kiểm tra khóa an toàn."""
         if known_weight_g <= 0:
             return {"ok": False, "error": "Khối lượng chuẩn phải lớn hơn 0g."}
 
         try:
-            raw_loaded = self.read_trimmed_median_raw(samples=25)
+            raw_loaded = self.read_trimmed_median_raw(samples=15, timeout_s=3.0)
             if self.mock_mode:
                 # Ở chế độ mock, giả lập delta hợp lý theo vật mẫu để test quy trình calibration UI
-                delta = known_weight_g * self.scale_ratio
+                diff = known_weight_g * self.scale_ratio
             else:
-                delta = raw_loaded - self.offset
+                diff = raw_loaded - self.offset
 
-            if abs(delta) < 500:
+            if abs(diff) < 3000:
                 return {
                     "ok": False,
-                    "error": f"Độ lệch ADC quá nhỏ (|delta|={abs(delta):.0f} < 500). Kiểm tra vật mẫu đã đặt lên cân chưa.",
+                    "error": "Tín hiệu cảm biến chưa ổn định hoặc chưa đặt đủ vật mẫu lên cân (diff quá nhỏ). Vui lòng thử lại.",
                 }
 
-            ratio = delta / float(known_weight_g)
+            ratio = diff / float(known_weight_g)
             if ratio < 0 and invert_if_negative:
                 ratio = -ratio
+
+            if abs(ratio) < 150 or abs(ratio) > 2500:
+                return {
+                    "ok": False,
+                    "error": "Tín hiệu cảm biến chưa ổn định hoặc chưa đặt đủ vật mẫu lên cân (diff quá nhỏ). Vui lòng thử lại.",
+                }
 
             saved = self.save_calibration(ratio, known_weight_g=known_weight_g)
             return {
@@ -410,7 +482,7 @@ class LoadcellManager:
                 "scale_ratio": round(ratio, 4),
                 "raw_loaded": round(raw_loaded, 1),
                 "offset": round(self.offset, 1),
-                "delta": round(delta, 1),
+                "delta": round(diff, 1),
                 "message": f"Hiệu chuẩn thành công! scale_ratio = {ratio:.4f}",
             }
         except Exception as exc:
@@ -476,23 +548,48 @@ class LoadcellManager:
         self._drift_raw_samples.clear()
         return False
 
+    def _read_raw_once_for_loop(self) -> float:
+        """Đọc 1 mẫu thô sạch duy nhất từ GPIO (hoặc Mock) cho _reader_loop."""
+        if self.mock_mode:
+            return float(self._mock_driver.read_raw_simulated())
+
+        for _ in range(3):
+            v = self._read_single_raw_hardware()
+            if v is not None:
+                return float(v)
+            time.sleep(0.005)
+        raise RuntimeError("Không đọc được mẫu HX711 hợp lệ.")
+
+    def _raw_to_unclamped_grams(self, raw_adc: float) -> float:
+        if self.mock_mode:
+            ratio = self._mock_driver.scale_ratio if self._mock_driver.scale_ratio != 0 else -326.1189
+            return max(0.0, (raw_adc - self._mock_driver.offset) / ratio)
+        if self.scale_ratio == 0:
+            return 0.0
+        return abs((raw_adc - self.offset) / self.scale_ratio)
+
     def _reader_loop(self) -> None:
-        """Luồng đọc nền 10Hz với bộ lọc trượt Rolling Median 5 mẫu, loại gai & Auto-Zero Drift."""
+        """Luồng ĐỘC QUYỀN đọc GPIO HX711: đẩy 30 mẫu thô sạch vào bộ đệm vòng & lọc 10Hz."""
         interval = 1.0 / max(1, settings.weight_sample_hz)
         while not self._stop_event.is_set():
             started = time.time()
             try:
                 if self.mock_mode or (self.hardware_available and HAS_RPI_GPIO):
-                    # Đọc 3 mẫu sạch mỗi nhịp 100ms rồi đưa qua Rolling Median 5 mẫu
-                    raw_adc, unclamped_g = self._read_raw_and_unclamped_grams(samples=3)
-                    sample_g = 0.0 if unclamped_g < self.zero_band_g else float(unclamped_g)
+                    raw_adc = self._read_raw_once_for_loop()
                     now = time.time()
-                    with self._lock:
-                        smooth_g = self._apply_rolling_median_filter(sample_g)
-                        self.last_grams = round(abs(smooth_g), 1)
+                    with self._raw_cond:
+                        self._raw_buffer.append((now, raw_adc))
+                        self._raw_seq += 1
+                        self.last_raw_timestamp = now
                         self.last_sample_time = now
                         self.scale_online = True
                         self.last_error = None
+                        self._raw_cond.notify_all()
+
+                        unclamped_g = self._raw_to_unclamped_grams(raw_adc)
+                        sample_g = 0.0 if unclamped_g < self.zero_band_g else float(unclamped_g)
+                        smooth_g = self._apply_rolling_median_filter(sample_g)
+                        self.last_grams = round(abs(smooth_g), 1)
                         self._track_auto_zero_drift(raw_adc, unclamped_g, now)
                         self._update_stability(self.last_grams, now)
                 else:
