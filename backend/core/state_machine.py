@@ -36,8 +36,10 @@ class NutritionStationStateMachine:
         self._lock = threading.RLock()
         self.state: StationState = StationState.IDLE
         self.auto_commit: bool = False
+        self.active_order_id: str | None = None
         self.current_inspection: dict[str, Any] | None = None
         self.last_committed_receipt: dict[str, Any] | None = None
+        self._below_idle_count: int = 0
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         try:
@@ -59,6 +61,7 @@ class NutritionStationStateMachine:
                 "scale_online": bool(self.scale.scale_online),
                 "scale_calibrated": bool(self.scale.calibrated),
                 "auto_commit": self.auto_commit,
+                "active_order_id": self.active_order_id,
                 "current_inspection": self.current_inspection,
                 "last_committed_receipt": self.last_committed_receipt,
                 "ts": time.time(),
@@ -69,46 +72,69 @@ class NutritionStationStateMachine:
             self.auto_commit = bool(enabled)
             return self.auto_commit
 
+    def set_active_order(self, order_id: str | None) -> str | None:
+        with self._lock:
+            self.active_order_id = order_id.strip() if order_id else None
+            return self.active_order_id
+
     def update(self) -> str:
         """Cập nhật một chu kỳ State Machine (gọi 10 lần/giây)."""
         w = self.scale.read_filtered_weight()
+        need_inspect = False
         with self._lock:
             prev = self.state
             if self.state == StationState.IDLE:
+                self._below_idle_count = 0
                 if w >= settings.detect_weight_g:
                     self.state = StationState.STABILIZING
                     logger.info(f"[STATE] Phát hiện khay thực phẩm ({w:.1f}g) -> STABILIZING")
 
             elif self.state == StationState.STABILIZING:
                 if w < settings.idle_weight_g:
-                    self.state = StationState.IDLE
-                elif self.scale.is_stable:
-                    self.state = StationState.INSPECTING
-                    logger.info(f"[STATE] Trọng lượng ổn định {w:.1f}g -> INSPECTING")
+                    self._below_idle_count += 1
+                    # Cần ít nhất 3 lần đọc liên tiếp < 8.0g mới reset về IDLE (chống 1 mẫu nhiễu 0g)
+                    if self._below_idle_count >= 3:
+                        self.state = StationState.IDLE
+                        self._below_idle_count = 0
+                        logger.info("[STATE] Cân trống (3 mẫu < 8.0g) -> IDLE")
+                else:
+                    self._below_idle_count = 0
+                    if self.scale.is_stable:
+                        self.state = StationState.INSPECTING
+                        need_inspect = True
+                        logger.info(f"[STATE] Trọng lượng ổn định {w:.1f}g -> INSPECTING")
 
             elif self.state == StationState.INSPECTING:
-                # Giải phóng lock tạm khi chạy inference AI để không nghẽn snapshot
                 pass
 
             elif self.state == StationState.CHECKOUT:
                 if w < settings.idle_weight_g:
-                    logger.info("[STATE] Đã nhấc thực phẩm khỏi cân -> IDLE")
-                    self.current_inspection = None
-                    self.state = StationState.IDLE
-                    self.camera.set_overlay_detections([])
+                    self._below_idle_count += 1
+                    if self._below_idle_count >= 3:
+                        logger.info("[STATE] Đã nhấc thực phẩm khỏi cân (3 mẫu < 8.0g) -> IDLE")
+                        self.current_inspection = None
+                        self.state = StationState.IDLE
+                        self._below_idle_count = 0
+                        self.camera.set_overlay_detections([])
+                else:
+                    self._below_idle_count = 0
 
-        if self.state == StationState.INSPECTING:
+        if need_inspect:
+            if self.lcd:
+                self.lcd.display_station_status(StationState.INSPECTING.value, w)
+            self._emit("state_change", self.snapshot())
             self.run_inspection(weight_gram=w)
 
-        # Cập nhật LCD 16x2 (chỉ ghi I2C khi chuỗi đổi nhờ dirty-check)
+        # Cập nhật LCD 16x2 (hiển thị tên thực phẩm + khối lượng nếu đã có kết quả nhận diện)
         if self.lcd:
             insp = self.current_inspection
             food_name = insp["nutrition"]["vietnamese_name"] if insp else None
             kcal = insp["nutrition"]["actual"]["energy_kcal"] if insp else None
             qual = insp["quality"]["status"] if insp else None
-            self.lcd.display_station_status(self.state.value, w, food_name=food_name, kcal=kcal, quality_status=qual)
+            display_state = StationState.CHECKOUT.value if (insp and self.state == StationState.IDLE) else self.state.value
+            self.lcd.display_station_status(display_state, w, food_name=food_name, kcal=kcal, quality_status=qual)
 
-        if self.state != prev:
+        if self.state != prev and not need_inspect:
             self._emit("state_change", self.snapshot())
 
         return self.state.value
@@ -163,14 +189,27 @@ class NutritionStationStateMachine:
 
         nutrition = calculate_nutrition(detected_class, w)
         batch_code = f"LOT-{time.strftime('%Y%m%d-%H%M%S')}"
+        act = nutrition.get("actual", {})
 
         inspection_result = {
             "batch_code": batch_code,
             "timestamp": utc_now_iso(),
             "local_date": local_today_str(),
             "weight_gram": round(w, 1),
+            "weight_g": round(w, 1),
             "detected_class": detected_class,
+            "food_name_en": nutrition.get("class_name", detected_class),
+            "food_name_vi": nutrition.get("vietnamese_name", detected_class),
             "confidence": round(confidence, 3),
+            "confidence_percent": round(confidence * 100.0, 1),
+            "unit_price_per_kg": int(nutrition.get("unit_price_per_kg", 0)),
+            "total_price_vnd": int(nutrition.get("total_price_vnd", 0)),
+            "calories": float(act.get("energy_kcal", 0.0)),
+            "protein": float(act.get("protein_g", 0.0)),
+            "lipid": float(act.get("fat_g", 0.0)),
+            "carb": float(act.get("carbohydrate_g", 0.0)),
+            "quality_status": quality.get("status", "FRESH"),
+            "bbox": prediction.get("bbox"),
             "inference_time_ms": int(prediction.get("inference_time_ms", 0)),
             "fps": float(prediction.get("fps", 0.0)),
             "strategy": prediction.get("strategy", "ncnn"),
@@ -186,8 +225,48 @@ class NutritionStationStateMachine:
             self.current_inspection = inspection_result
             if w >= settings.idle_weight_g:
                 self.state = StationState.CHECKOUT
+            target_order_id = self.active_order_id
 
-        if self.auto_commit and w >= settings.idle_weight_g:
+        if self.lcd:
+            self.lcd.display_station_status(
+                StationState.CHECKOUT.value,
+                w,
+                food_name=nutrition.get("vietnamese_name"),
+                kcal=act.get("energy_kcal"),
+                quality_status=quality.get("status"),
+            )
+
+        # Tự động đối chiếu & TÍCH XANH vào Phiếu Yêu Cầu Nguyên Liệu đang hoạt động nếu khớp loại + đạt >= 95%
+        auto_checked = False
+        if target_order_id and w >= settings.detect_weight_g and quality.get("status") != "REJECTED":
+            from backend.database.crud import get_procurement_order
+            from backend.services.station_service import station_service
+
+            order = get_procurement_order(target_order_id)
+            if order and order.get("status") in {"PENDING", "IN_PROGRESS"}:
+                matched_item = next(
+                    (
+                        it
+                        for it in order["items"]
+                        if it["status"] == "PENDING"
+                        and it["class_name"].lower() == nutrition["class_name"].lower()
+                        and w >= float(it["min_acceptable_gram"])
+                    ),
+                    None,
+                )
+                if matched_item is not None:
+                    try:
+                        station_service.commit_current_inspection(
+                            order_id=target_order_id,
+                            order_item_id=matched_item["id"],
+                            confirmed_by="Trạm cân AI (Tự động tích xanh)",
+                            note="Tự động đối chiếu đạt chuẩn >= 95%",
+                        )
+                        auto_checked = True
+                    except Exception as exc:
+                        logger.warning(f"[STATE] Auto tích xanh bỏ qua: {exc}")
+
+        if not auto_checked and self.auto_commit and w >= settings.idle_weight_g:
             from backend.services.station_service import station_service
 
             station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định")

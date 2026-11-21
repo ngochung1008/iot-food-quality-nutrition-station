@@ -133,15 +133,32 @@ def local_today_str() -> str:
 
 def _ensure_migrations(conn: Any) -> None:
     """Bổ sung cột mới vào bảng cũ nếu database đã tồn tại từ phiên bản trước."""
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(intake_logs)").fetchall()}
-    if "order_id" not in cols:
-        conn.execute("ALTER TABLE intake_logs ADD COLUMN order_id TEXT DEFAULT ''")
-    if "order_item_id" not in cols:
-        conn.execute("ALTER TABLE intake_logs ADD COLUMN order_item_id TEXT DEFAULT ''")
+    migrations = {
+        "foods_nutrition": [("unit_price_vnd_per_kg", "INTEGER NOT NULL DEFAULT 40000")],
+        "procurement_orders": [
+            ("target_kcal_per_serving", "REAL NOT NULL DEFAULT 650.0"),
+            ("estimated_total_cost_vnd", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+        "procurement_items": [
+            ("unit_price_per_kg", "INTEGER NOT NULL DEFAULT 40000"),
+            ("estimated_cost_vnd", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+        "intake_logs": [
+            ("order_id", "TEXT DEFAULT ''"),
+            ("order_item_id", "TEXT DEFAULT ''"),
+            ("unit_price_per_kg", "INTEGER NOT NULL DEFAULT 0"),
+            ("total_price_vnd", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    }
+    for tbl, col_defs in migrations.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
+        for col_name, col_sql in col_defs:
+            if col_name not in existing:
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_name} {col_sql}")
 
 
 def init_database() -> None:
-    """Khởi tạo toàn bộ bảng SQLite, seed 64 thực phẩm, 3 tài khoản mẫu và 14 món ăn bếp tập thể."""
+    """Khởi tạo toàn bộ bảng SQLite, seed 64 thực phẩm (kèm đơn giá), 3 tài khoản mẫu và 14 món ăn."""
     now = utc_now_iso()
     with get_db_conn() as conn:
         conn.executescript(SCHEMA_SQL)
@@ -155,8 +172,8 @@ def init_database() -> None:
                     code, class_name, vietnamese_name, food_group,
                     edible_portion_percent, energy_kcal, protein_g, fat_g,
                     carbohydrate_g, fiber_g, calcium_mg, iron_mg, vitamin_c_mg,
-                    source, is_active, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    unit_price_vnd_per_kg, source, is_active, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 """,
                 (
                     profile.code,
@@ -172,9 +189,18 @@ def init_database() -> None:
                     profile.calcium_mg,
                     profile.iron_mg,
                     profile.vitamin_c_mg,
+                    profile.unit_price_vnd_per_kg,
                     profile.source,
                     now,
                 ),
+            )
+            conn.execute(
+                """
+                UPDATE foods_nutrition
+                SET unit_price_vnd_per_kg = ?
+                WHERE class_name = ? AND unit_price_vnd_per_kg = 40000
+                """,
+                (profile.unit_price_vnd_per_kg, profile.class_name),
             )
 
         # 2. Seed 3 tài khoản demo RBAC
@@ -300,6 +326,7 @@ def _row_to_food(row: Any) -> dict[str, Any]:
         "calcium_mg": row["calcium_mg"],
         "iron_mg": row["iron_mg"],
         "vitamin_c_mg": row["vitamin_c_mg"],
+        "unit_price_vnd_per_kg": row["unit_price_vnd_per_kg"],
         "source": row["source"],
         "is_active": bool(row["is_active"]),
         "updated_at": row["updated_at"],
@@ -345,7 +372,7 @@ def update_food_nutrition(food_id: int, fields: dict[str, Any]) -> dict[str, Any
     allowed = {
         "vietnamese_name", "food_group", "edible_portion_percent",
         "energy_kcal", "protein_g", "fat_g", "carbohydrate_g",
-        "fiber_g", "calcium_mg", "iron_mg", "vitamin_c_mg", "is_active",
+        "fiber_g", "calcium_mg", "iron_mg", "vitamin_c_mg", "unit_price_vnd_per_kg", "is_active",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     with get_db_conn() as conn:
@@ -536,6 +563,8 @@ def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
         "total_protein_g": order_row["total_protein_g"],
         "total_fat_g": order_row["total_fat_g"],
         "total_carb_g": order_row["total_carb_g"],
+        "target_kcal_per_serving": order_row["target_kcal_per_serving"],
+        "estimated_total_cost_vnd": order_row["estimated_total_cost_vnd"],
         "status": order_row["status"],
         "created_by": order_row["created_by"],
         "created_at": order_row["created_at"],
@@ -559,8 +588,9 @@ def create_procurement_order(
     created_by: str,
     note: str = "",
     tolerance_percent: float = 5.0,
+    target_kcal_per_serving: float = 650.0,
 ) -> dict[str, Any]:
-    """Lập kế hoạch bữa ăn -> Tính tổng Calo/Macro -> Sinh Phiếu yêu cầu nguyên liệu đẩy xuống trạm cân."""
+    """Lập kế hoạch bữa ăn -> Tính tổng Calo/Macro/Chi phí dự kiến -> Sinh Phiếu Yêu Cầu Nguyên Liệu."""
     if servings <= 0:
         raise ValueError("Số lượng suất ăn phải lớn hơn 0.")
     if not dish_ids:
@@ -577,6 +607,10 @@ def create_procurement_order(
         total_protein = 0.0
         total_fat = 0.0
         total_carb = 0.0
+
+        # Lấy đơn giá tham khảo của 64 nguyên liệu
+        price_rows = conn.execute("SELECT class_name, unit_price_vnd_per_kg FROM foods_nutrition").fetchall()
+        price_map = {r["class_name"]: int(r["unit_price_vnd_per_kg"]) for r in price_rows}
 
         for did in dish_ids:
             dish_row = conn.execute("SELECT * FROM dishes WHERE id = ? AND is_active = 1", (did,)).fetchone()
@@ -597,30 +631,39 @@ def create_procurement_order(
             for ing in dish_data["ingredients"]:
                 cls_name = ing["class_name"]
                 req_g = round(float(ing["grams_per_serving"]) * servings, 1)
+                unit_price = price_map.get(cls_name, 40000)
                 if cls_name not in aggregated_ingredients:
                     aggregated_ingredients[cls_name] = {
                         "class_name": cls_name,
                         "food_name_vi": ing["vietnamese_name"],
                         "food_group": ing["food_group"],
                         "required_gram": req_g,
+                        "unit_price_per_kg": unit_price,
                     }
                 else:
                     aggregated_ingredients[cls_name]["required_gram"] = round(
                         aggregated_ingredients[cls_name]["required_gram"] + req_g, 1
                     )
 
+        est_total_cost = sum(
+            int(round((it["required_gram"] / 1000.0) * it["unit_price_per_kg"]))
+            for it in aggregated_ingredients.values()
+        )
+
         conn.execute(
             """
             INSERT INTO procurement_orders (
                 id, order_code, title, meal_date, meal_shift, servings, dishes_json,
                 total_kcal, total_protein_g, total_fat_g, total_carb_g,
+                target_kcal_per_serving, estimated_total_cost_vnd,
                 status, created_by, created_at, note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
             """,
             (
                 order_id, order_code, title.strip(), meal_date, meal_shift, servings,
                 json.dumps(selected_dishes, ensure_ascii=False),
                 round(total_kcal, 1), round(total_protein, 1), round(total_fat, 1), round(total_carb, 1),
+                float(target_kcal_per_serving), est_total_cost,
                 created_by, now, note.strip(),
             ),
         )
@@ -628,17 +671,20 @@ def create_procurement_order(
         for item in aggregated_ingredients.values():
             req = item["required_gram"]
             min_acc = round(req * (1.0 - tolerance_percent / 100.0), 1)
+            unit_p = int(item["unit_price_per_kg"])
+            est_cost = int(round((req / 1000.0) * unit_p))
             item_id = f"poi_{uuid.uuid4().hex[:10]}"
             conn.execute(
                 """
                 INSERT INTO procurement_items (
                     id, order_id, class_name, food_name_vi, food_group,
-                    required_gram, tolerance_percent, min_acceptable_gram, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    required_gram, tolerance_percent, min_acceptable_gram,
+                    unit_price_per_kg, estimated_cost_vnd, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
                 """,
                 (
                     item_id, order_id, item["class_name"], item["food_name_vi"],
-                    item["food_group"], req, tolerance_percent, min_acc,
+                    item["food_group"], req, tolerance_percent, min_acc, unit_p, est_cost,
                 ),
             )
 
@@ -736,8 +782,9 @@ def insert_intake_log(doc: dict[str, Any]) -> dict[str, Any]:
                 inference_time_ms, strategy,
                 energy_kcal, protein_g, fat_g, carbohydrate_g, fiber_g,
                 calcium_mg, iron_mg, vitamin_c_mg,
-                image_url, note, confirmed_by, order_id, order_item_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                image_url, note, confirmed_by, order_id, order_item_id,
+                unit_price_per_kg, total_price_vnd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 doc["id"], doc["batch_code"], doc["timestamp"], local_date, doc["station_id"],
@@ -748,6 +795,7 @@ def insert_intake_log(doc: dict[str, Any]) -> dict[str, Any]:
                 doc["calcium_mg"], doc["iron_mg"], doc["vitamin_c_mg"],
                 doc.get("image_url"), doc.get("note", ""), doc.get("confirmed_by", "Trạm cân AI"),
                 doc.get("order_id", ""), doc.get("order_item_id", ""),
+                int(doc.get("unit_price_per_kg", 0)), int(doc.get("total_price_vnd", 0)),
             ),
         )
 

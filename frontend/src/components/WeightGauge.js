@@ -1,51 +1,71 @@
 /**
- * Component đồng hồ trọng lượng real-time, trạng thái State Machine, nút Tare & Lưu phiếu lẻ.
+ * Thẻ Đồng hồ trọng lượng real-time (48-56px tabular-nums) kết hợp
+ * Quy trình 4 bước dạng Danh Sách Dọc có Ô Tích Tròn chuyển xanh mượt mà.
  */
-const MAX_SCALE_G = 5000;
-
 export function renderWeightGauge(container) {
   container.innerHTML = `
     <div class="card">
       <div class="card-head">
-        <h3 class="card-title">Trọng Lượng Thực Tế (Loadcell HX711)</h3>
+        <h3 class="card-title">Cân Trọng Lượng &amp; Tiến Trình Kiểm Định</h3>
         <span id="wg-online-badge" class="badge badge-success">
           <span class="dot dot-ok"></span> HX711 Online
         </span>
       </div>
 
-      <div class="gauge-wrap">
-        <div class="gauge-svg-box">
-          <svg viewBox="0 0 180 110" width="168" height="102" aria-label="Đồng hồ cân">
-            <path d="M 20 95 A 70 70 0 0 1 160 95" fill="none" stroke="#E2E8F0" stroke-width="14" stroke-linecap="round"/>
-            <path id="wg-arc" d="M 20 95 A 70 70 0 0 1 160 95" fill="none" stroke="#2E7D32" stroke-width="14" stroke-linecap="round"
-              stroke-dasharray="220" stroke-dashoffset="220"/>
-            <text x="90" y="84" text-anchor="middle" font-size="12" font-weight="700" fill="#64748B">MAX 5.000g</text>
-          </svg>
+      <div class="scale-stepper-grid">
+        <!-- Cột trái: Số cân lớn + Nút thao tác POS -->
+        <div style="display:flex; flex-direction:column; gap:14px;">
+          <div class="weight-panel">
+            <div style="font-size:15px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">
+              Trọng lượng đĩa cân
+            </div>
+            <div>
+              <span id="wg-grams" class="weight-hero tabular-nums">0.0</span>
+              <span class="weight-unit">g</span>
+            </div>
+            <div id="wg-kg" class="tabular-nums" style="font-size:16px; font-weight:600; color:var(--text-secondary); margin-top:4px;">
+              0.000 kg
+            </div>
+            <div style="margin-top:12px; display:flex; justify-content:center; gap:8px; flex-wrap:wrap;">
+              <span id="wg-stable-badge" class="badge badge-neutral">Chờ đặt thực phẩm</span>
+              <span id="wg-calib-badge" class="badge badge-success">Đã hiệu chuẩn</span>
+            </div>
+          </div>
+
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+            <button id="btn-tare" class="btn btn-lg btn-outline" type="button">
+              Tare / Về 0g
+            </button>
+            <button id="btn-manual-confirm" class="btn btn-lg btn-green" type="button">
+              Xác nhận thủ công
+            </button>
+          </div>
         </div>
 
-        <div class="weight-readout">
-          <div style="display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;">
-            <span id="wg-grams" class="weight-value tabular-nums">0.0</span>
-            <span class="weight-unit">g</span>
-            <span id="wg-kg" style="font-size:14px; font-weight:700; color:var(--text-muted);">(0.000 kg)</span>
+        <!-- Cột phải: Quy trình 4 bước dọc với ô tích tròn -->
+        <div>
+          <div style="font-size:15px; font-weight:700; color:var(--text-secondary); margin-bottom:10px;">
+            Trạng thái tự động 4 bước
           </div>
-          <div style="margin-top:8px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-            <span id="wg-stable-badge" class="badge badge-neutral">Chờ ổn định</span>
-            <span id="wg-calib-badge" class="badge badge-success">Đã hiệu chuẩn</span>
-          </div>
+          <ol class="v-stepper" id="v-stepper">
+            <li class="v-step" data-step-num="1">
+              <span class="v-step-circle"><span class="step-idx">1</span><span class="tick-mark"></span></span>
+              <span class="v-step-text">1. Đặt thực phẩm lên đĩa cân</span>
+            </li>
+            <li class="v-step" data-step-num="2">
+              <span class="v-step-circle"><span class="step-idx">2</span><span class="tick-mark"></span></span>
+              <span class="v-step-text">2. Cân ổn định trọng lượng</span>
+            </li>
+            <li class="v-step" data-step-num="3">
+              <span class="v-step-circle"><span class="step-idx">3</span><span class="tick-mark"></span></span>
+              <span class="v-step-text">3. AI nhận diện &amp; kiểm định chất lượng</span>
+            </li>
+            <li class="v-step" data-step-num="4">
+              <span class="v-step-circle"><span class="step-idx">4</span><span class="tick-mark"></span></span>
+              <span class="v-step-text">4. Đối chiếu phiếu &amp; tích xanh hoàn thành</span>
+            </li>
+          </ol>
         </div>
-      </div>
-
-      <div class="stepper" id="wg-stepper">
-        <div class="step-item" data-step="IDLE">1. CHỜ HÀNG</div>
-        <div class="step-item" data-step="STABILIZING">2. ỔN ĐỊNH</div>
-        <div class="step-item" data-step="INSPECTING">3. KIỂM ĐỊNH AI</div>
-        <div class="step-item" data-step="CHECKOUT">4. XÁC NHẬN</div>
-      </div>
-
-      <div style="display:grid; grid-template-columns: 1fr 1.25fr; gap:10px; margin-top:10px;">
-        <button id="btn-tare" class="btn btn-outline" type="button">Tare / Trừ bì (0g)</button>
-        <button id="btn-commit-receipt" class="btn btn-green" type="button">Lưu phiếu nhập lẻ</button>
       </div>
     </div>
   `;
@@ -56,31 +76,32 @@ export function updateWeightGauge(snapshot) {
   const g = Math.max(0, Number(snapshot.weight_gram || 0));
   const gramsEl = document.getElementById("wg-grams");
   const kgEl = document.getElementById("wg-kg");
-  const arcEl = document.getElementById("wg-arc");
   const stableEl = document.getElementById("wg-stable-badge");
   const onlineEl = document.getElementById("wg-online-badge");
   const calibEl = document.getElementById("wg-calib-badge");
-  const commitBtn = document.getElementById("btn-commit-receipt");
+  const confirmBtn = document.getElementById("btn-manual-confirm");
 
   if (gramsEl) gramsEl.textContent = g.toFixed(1);
-  if (kgEl) kgEl.textContent = `(${(g / 1000).toFixed(3)} kg)`;
-
-  if (arcEl) {
-    const ratio = Math.min(1, g / MAX_SCALE_G);
-    arcEl.setAttribute("stroke-dashoffset", String((220 - ratio * 220).toFixed(1)));
-    arcEl.setAttribute("stroke", g >= 4500 ? "#C62828" : snapshot.is_stable ? "#2E7D32" : "#F57C00");
-  }
+  if (kgEl) kgEl.textContent = `${(g / 1000).toFixed(3)} kg`;
 
   if (stableEl) {
-    stableEl.className = snapshot.is_stable ? "badge badge-success" : "badge badge-warning";
-    stableEl.textContent = snapshot.is_stable ? "Trọng lượng ổn định" : "Đang dao động / Chờ vật";
+    if (g < 8.0) {
+      stableEl.className = "badge badge-neutral";
+      stableEl.textContent = "Đĩa cân trống";
+    } else if (snapshot.is_stable) {
+      stableEl.className = "badge badge-success";
+      stableEl.textContent = "Trọng lượng ổn định";
+    } else {
+      stableEl.className = "badge badge-warning";
+      stableEl.textContent = "Đang ổn định cân";
+    }
   }
 
   if (onlineEl) {
     const ok = Boolean(snapshot.scale_online);
     onlineEl.className = ok ? "badge badge-success" : "badge badge-danger";
     onlineEl.innerHTML = `<span class="dot ${ok ? "dot-ok" : "dot-err"}"></span> ${
-      ok ? (snapshot.mock_hardware ? "HX711 Mock Online" : "HX711 Online") : "Mất tín hiệu cân"
+      ok ? (snapshot.mock_hardware ? "HX711 Mock" : "HX711 Online") : "Mất tín hiệu cân"
     }`;
   }
 
@@ -90,18 +111,41 @@ export function updateWeightGauge(snapshot) {
     calibEl.textContent = cal ? "Đã hiệu chuẩn" : "Chưa hiệu chuẩn";
   }
 
-  document.querySelectorAll("#wg-stepper .step-item").forEach((el) => {
-    el.classList.toggle("active", el.dataset.step === snapshot.state);
+  // Tính bước hoàn thành & bước đang chạy cho Vertical Stepper
+  const st = snapshot.state || "IDLE";
+  const insp = snapshot.current_inspection;
+  const committed = Boolean(insp?.committed);
+
+  let completedUpTo = 0;
+  let activeStep = 1;
+
+  if (st === "IDLE" && !insp) {
+    completedUpTo = 0;
+    activeStep = 1;
+  } else if (st === "STABILIZING") {
+    completedUpTo = 1;
+    activeStep = 2;
+  } else if (st === "INSPECTING") {
+    completedUpTo = 2;
+    activeStep = 3;
+  } else if (st === "CHECKOUT" || insp) {
+    completedUpTo = committed ? 4 : 3;
+    activeStep = committed ? 0 : 4;
+  }
+
+  document.querySelectorAll("#v-stepper .v-step").forEach((li) => {
+    const n = Number(li.dataset.stepNum || 0);
+    li.classList.toggle("is-done", n <= completedUpTo);
+    li.classList.toggle("is-active", n === activeStep && n > completedUpTo);
   });
 
-  if (commitBtn) {
-    const committed = Boolean(snapshot.current_inspection?.committed);
+  if (confirmBtn) {
     if (committed) {
-      commitBtn.textContent = "Đã lưu phiếu lô này";
-      commitBtn.disabled = true;
+      confirmBtn.textContent = "Đã lưu phiếu lô này";
+      confirmBtn.disabled = true;
     } else {
-      commitBtn.textContent = "Lưu phiếu nhập lẻ";
-      commitBtn.disabled = g < 1.0 && !snapshot.current_inspection;
+      confirmBtn.textContent = "Xác nhận thủ công";
+      confirmBtn.disabled = g < 1.0 && !insp;
     }
   }
 }

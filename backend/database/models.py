@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS foods_nutrition (
     calcium_mg REAL NOT NULL DEFAULT 0.0,
     iron_mg REAL NOT NULL DEFAULT 0.0,
     vitamin_c_mg REAL NOT NULL DEFAULT 0.0,
+    unit_price_vnd_per_kg INTEGER NOT NULL DEFAULT 40000,
     source TEXT NOT NULL DEFAULT 'VTN_FCT_2007',
     is_active INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
@@ -74,6 +75,8 @@ CREATE TABLE IF NOT EXISTS procurement_orders (
     total_protein_g REAL NOT NULL DEFAULT 0.0,
     total_fat_g REAL NOT NULL DEFAULT 0.0,
     total_carb_g REAL NOT NULL DEFAULT 0.0,
+    target_kcal_per_serving REAL NOT NULL DEFAULT 650.0,
+    estimated_total_cost_vnd INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'PENDING',
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -90,6 +93,8 @@ CREATE TABLE IF NOT EXISTS procurement_items (
     required_gram REAL NOT NULL,
     tolerance_percent REAL NOT NULL DEFAULT 5.0,
     min_acceptable_gram REAL NOT NULL,
+    unit_price_per_kg INTEGER NOT NULL DEFAULT 40000,
+    estimated_cost_vnd INTEGER NOT NULL DEFAULT 0,
     actual_gram REAL NOT NULL DEFAULT 0.0,
     quality_status TEXT DEFAULT '',
     confidence REAL NOT NULL DEFAULT 0.0,
@@ -130,7 +135,9 @@ CREATE TABLE IF NOT EXISTS intake_logs (
     note TEXT DEFAULT '',
     confirmed_by TEXT DEFAULT 'Trạm cân AI',
     order_id TEXT DEFAULT '',
-    order_item_id TEXT DEFAULT ''
+    order_item_id TEXT DEFAULT '',
+    unit_price_per_kg INTEGER NOT NULL DEFAULT 0,
+    total_price_vnd INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_intake_logs_ts ON intake_logs(timestamp DESC);

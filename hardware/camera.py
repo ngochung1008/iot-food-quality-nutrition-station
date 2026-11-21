@@ -153,9 +153,9 @@ class CameraManager:
             self._overlay_ts = time.time()
 
     def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Vẽ bounding box gần nhất (hết hạn sau 3s nếu không có cập nhật mới)."""
+        """Vẽ bounding box gần nhất lên luồng video trực tiếp (giữ tối đa 15s khi vật còn trên cân)."""
         with self._lock:
-            dets = list(self._overlay_detections) if (time.time() - self._overlay_ts) < 3.0 else []
+            dets = list(self._overlay_detections) if (time.time() - self._overlay_ts) < 15.0 else []
         if not dets:
             return frame
         from ai_engine.detector import draw_detections

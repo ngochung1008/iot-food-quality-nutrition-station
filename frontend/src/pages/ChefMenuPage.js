@@ -29,15 +29,15 @@ export class ChefMenuPage {
 
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:12px;">
               <div>
-                <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Tên kế hoạch bữa ăn</label>
+                <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Tên kế hoạch bữa ăn</label>
                 <input id="plan-title" class="input" style="width:100%;" value="Thực đơn Bữa Trưa Tập Thể" />
               </div>
               <div>
-                <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Ngày phục vụ</label>
+                <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Ngày phục vụ</label>
                 <input id="plan-date" type="date" class="input" style="width:100%;" value="${today}" />
               </div>
               <div>
-                <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Ca ăn</label>
+                <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Ca ăn</label>
                 <select id="plan-shift" class="select" style="width:100%;">
                   <option value="Bữa sáng">Bữa sáng</option>
                   <option value="Bữa trưa" selected>Bữa trưa</option>
@@ -45,19 +45,23 @@ export class ChefMenuPage {
                   <option value="Bữa phụ">Bữa phụ</option>
                 </select>
               </div>
-              <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+              <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;">
                 <div>
-                  <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Số suất ăn</label>
+                  <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Số suất ăn</label>
                   <input id="plan-servings" type="number" min="1" max="10000" class="input" style="width:100%;" value="50" />
                 </div>
                 <div>
-                  <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Sai số (%)</label>
+                  <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Mục tiêu kcal/suất</label>
+                  <input id="plan-target-kcal" type="number" min="100" max="5000" class="input" style="width:100%;" value="650" />
+                </div>
+                <div>
+                  <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Sai số (%)</label>
                   <input id="plan-tolerance" type="number" min="0" max="25" class="input" style="width:100%;" value="5" />
                 </div>
               </div>
             </div>
 
-            <div style="font-size:12.5px; font-weight:700; color:var(--text-secondary); margin-bottom:6px;">
+            <div style="font-size:14.5px; font-weight:700; color:var(--text-secondary); margin-bottom:6px;">
               Chọn món ăn cho thực đơn:
             </div>
             <div id="chef-dish-picker" style="max-height:280px; overflow-y:auto; border:1px solid var(--border-light); border-radius:var(--radius); padding:8px; display:flex; flex-direction:column; gap:6px;">
@@ -101,6 +105,7 @@ export class ChefMenuPage {
                   <tr>
                     <th>Nguyên liệu (64 lớp AI)</th>
                     <th>Chuẩn cần nhập</th>
+                    <th>Đơn giá dự kiến</th>
                     <th>Đạt chuẩn (≥95%)</th>
                   </tr>
                 </thead>
@@ -207,10 +212,10 @@ export class ChefMenuPage {
             <input type="checkbox" class="dish-chk" value="${d.id}" ${checked} style="margin-top:3px; width:18px; height:18px;" />
             <div style="flex:1;">
               <div style="display:flex; justify-content:space-between; gap:8px;">
-                <strong style="font-size:13.5px;">${d.name_vi}</strong>
+                <strong style="font-size:16px;">${d.name_vi}</strong>
                 <span class="badge badge-neutral">${d.per_serving.energy_kcal} kcal/suất</span>
               </div>
-              <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${ingText}</div>
+              <div style="font-size:14px; color:var(--text-muted); margin-top:2px;">${ingText}</div>
             </div>
           </label>
         `;
@@ -242,10 +247,13 @@ export class ChefMenuPage {
       fatPer += d.per_serving.fat_g;
       carbPer += d.per_serving.carbohydrate_g;
       d.ingredients.forEach((ing) => {
+        const foodMeta = this.foods64.find((f) => f.class_name === ing.class_name);
+        const unitPrice = foodMeta?.unit_price_vnd_per_kg || 40000;
         const cur = agg.get(ing.class_name) || {
           name: ing.vietnamese_name,
           cls: ing.class_name,
           grams: 0,
+          unitPrice,
         };
         cur.grams += ing.grams_per_serving * servings;
         agg.set(ing.class_name, cur);
@@ -256,10 +264,11 @@ export class ChefMenuPage {
       const el = document.getElementById(id);
       if (el) el.textContent = txt;
     };
+    const targetKcal = Number(document.getElementById("plan-target-kcal")?.value || 650);
 
     setText("plan-selected-count", `${this.selectedDishIds.size} món đã chọn`);
     setText("plan-kcal", `${Math.round(kcalPer * servings).toLocaleString("vi-VN")} kcal`);
-    setText("plan-kcal-per", `${kcalPer.toFixed(1)} kcal / suất`);
+    setText("plan-kcal-per", `${kcalPer.toFixed(1)} / mục tiêu ${targetKcal} kcal`);
     setText("plan-prot", `${(protPer * servings).toFixed(1)} g`);
     setText("plan-prot-per", `${protPer.toFixed(1)} g / suất`);
     setText("plan-fat", `${(fatPer * servings).toFixed(1)} g`);
@@ -271,16 +280,18 @@ export class ChefMenuPage {
     if (!tbody) return;
     const rows = Array.from(agg.values()).sort((a, b) => b.grams - a.grams);
     if (!rows.length) {
-      tbody.innerHTML = `<tr><td colspan="3" style="text-align:center; color:var(--text-muted);">Chưa có món ăn được chọn</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--text-muted);">Chưa có món ăn được chọn</td></tr>`;
       return;
     }
     tbody.innerHTML = rows
       .map((r) => {
         const minG = r.grams * (1 - tol / 100);
+        const estCost = Math.round((r.grams / 1000) * r.unitPrice);
         return `
           <tr>
             <td><strong>${r.name}</strong> <span style="color:var(--text-muted);">(${r.cls})</span></td>
             <td class="tabular-nums"><strong>${r.grams.toLocaleString("vi-VN")} g</strong> (${(r.grams / 1000).toFixed(2)} kg)</td>
+            <td class="tabular-nums">${r.unitPrice.toLocaleString("vi-VN")} đ/kg<br><span style="font-size:14px; color:var(--text-muted);">~${estCost.toLocaleString("vi-VN")} đ</span></td>
             <td class="tabular-nums">>= ${minG.toFixed(0)} g (-${tol}%)</td>
           </tr>
         `;
@@ -306,11 +317,11 @@ export class ChefMenuPage {
         return `
           <tr>
             <td class="tabular-nums"><strong>${o.order_code}</strong></td>
-            <td><strong>${o.title}</strong><br><span style="font-size:11.5px; color:var(--text-muted);">${o.meal_date} | ${o.meal_shift}</span></td>
+            <td><strong>${o.title}</strong><br><span style="font-size:14px; color:var(--text-muted);">${o.meal_date} | ${o.meal_shift}</span></td>
             <td class="tabular-nums">${o.servings} suất</td>
             <td class="tabular-nums">${Math.round(o.total_kcal).toLocaleString("vi-VN")} kcal</td>
             <td>
-              <div style="font-size:12px; font-weight:700;">${o.progress.completed} / ${o.progress.total} nguyên liệu (${o.progress.percent}%)</div>
+              <div style="font-size:14px; font-weight:700;">${o.progress.completed} / ${o.progress.total} nguyên liệu (${o.progress.percent}%)</div>
               <div class="progress-track" style="width:140px;"><div class="progress-fill" style="width:${o.progress.percent}%;"></div></div>
             </td>
             <td>${stBadge}</td>
@@ -333,7 +344,7 @@ export class ChefMenuPage {
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;" data-idx="${idx}">
           <select class="select ing-cls" style="flex:1; min-width:240px;">${options}</select>
           <input type="number" class="input ing-grams" style="width:140px;" min="1" step="1" value="${row.grams_per_serving}" placeholder="gram/suất" />
-          <span style="font-size:12.5px; color:var(--text-muted);">g / suất</span>
+          <span style="font-size:14.5px; color:var(--text-muted);">g / suất</span>
           <button type="button" class="btn btn-sm btn-outline btn-rem-ing">Xóa</button>
         </div>
       `
@@ -361,6 +372,7 @@ export class ChefMenuPage {
 
   _bindEvents() {
     document.getElementById("plan-servings")?.addEventListener("input", () => this._recalcMealPlan());
+    document.getElementById("plan-target-kcal")?.addEventListener("input", () => this._recalcMealPlan());
     document.getElementById("plan-tolerance")?.addEventListener("input", () => this._recalcMealPlan());
     document.getElementById("btn-refresh-orders")?.addEventListener("click", () => this.loadData());
 
@@ -371,6 +383,7 @@ export class ChefMenuPage {
           meal_date: document.getElementById("plan-date")?.value,
           meal_shift: document.getElementById("plan-shift")?.value,
           servings: Number(document.getElementById("plan-servings")?.value || 50),
+          target_kcal_per_serving: Number(document.getElementById("plan-target-kcal")?.value || 650),
           tolerance_percent: Number(document.getElementById("plan-tolerance")?.value || 5),
           dish_ids: Array.from(this.selectedDishIds),
         };

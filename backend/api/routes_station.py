@@ -31,6 +31,10 @@ class AutoCommitRequest(BaseModel):
     enabled: bool
 
 
+class ActiveOrderRequest(BaseModel):
+    order_id: str | None = None
+
+
 class SimulateWeightRequest(BaseModel):
     weight_gram: float = Field(..., ge=0.0, le=50000.0)
 
@@ -100,6 +104,13 @@ def toggle_auto_commit(body: AutoCommitRequest):
     """Bật/tắt tự động lưu phiếu ngay khi cân ổn định."""
     enabled = station_service.state_machine.set_auto_commit(body.enabled)
     return {"ok": True, "auto_commit": enabled}
+
+
+@router.post("/active-order")
+def set_active_order(body: ActiveOrderRequest):
+    """Chọn Phiếu Yêu Cầu Nguyên Liệu đang tiếp nhận tại trạm để tự động tích xanh."""
+    active_id = station_service.state_machine.set_active_order(body.order_id)
+    return {"ok": True, "active_order_id": active_id}
 
 
 @router.post("/simulate/weight")

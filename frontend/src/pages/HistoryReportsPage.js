@@ -268,9 +268,9 @@ export class HistoryReportsPage {
           return `
             <tr>
               <td>${imgHtml}</td>
-              <td><strong>${r.batch_code}</strong><br><span style="font-size:11.5px; color:var(--text-muted);">${r.local_date} ${r.timestamp.slice(11, 19)}</span></td>
-              <td><strong>${r.food_name_vi}</strong><br><span style="font-size:11.5px; color:var(--text-muted);">${r.food_group}</span></td>
-              <td class="tabular-nums"><strong>${Number(r.weight_gram).toFixed(1)} g</strong><br><span style="font-size:11.5px; color:var(--text-muted);">Ăn được: ${Number(r.edible_gram).toFixed(1)} g</span></td>
+              <td><strong>${r.batch_code}</strong><br><span style="font-size:14px; color:var(--text-muted);">${r.local_date} ${r.timestamp.slice(11, 19)}</span></td>
+              <td><strong>${r.food_name_vi}</strong><br><span style="font-size:14px; color:var(--text-muted);">${r.food_group}</span></td>
+              <td class="tabular-nums"><strong>${Number(r.weight_gram).toFixed(1)} g</strong><br><span style="font-size:14px; color:var(--text-muted);">Ăn được: ${Number(r.edible_gram).toFixed(1)} g</span></td>
               <td><span class="badge ${bClass}">${r.quality_status} (${Math.round(r.confidence * 100)}%)</span></td>
               <td class="tabular-nums"><strong>${Number(r.energy_kcal).toFixed(1)}</strong> kcal</td>
               <td class="tabular-nums">${r.protein_g}g / ${r.fat_g}g / ${r.carbohydrate_g}g</td>

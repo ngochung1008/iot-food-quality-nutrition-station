@@ -38,6 +38,7 @@ def calculate_nutrition(label: str, weight_gram: float, use_edible_portion: bool
                 "calcium_mg": profile.calcium_mg,
                 "iron_mg": profile.iron_mg,
                 "vitamin_c_mg": profile.vitamin_c_mg,
+                "unit_price_vnd_per_kg": profile.unit_price_vnd_per_kg,
                 "source": profile.source,
             }
 
@@ -51,6 +52,8 @@ def calculate_nutrition(label: str, weight_gram: float, use_edible_portion: bool
             "weight_gram": round(weight_g, 1),
             "edible_portion_percent": 100.0,
             "edible_gram": round(weight_g, 1),
+            "unit_price_per_kg": 0,
+            "total_price_vnd": 0,
             "per_100g": {},
             "actual": {
                 "energy_kcal": 0.0,
@@ -83,6 +86,8 @@ def calculate_nutrition(label: str, weight_gram: float, use_edible_portion: bool
     calcium = round(float(food_row["calcium_mg"]) * factor, 1)
     iron = round(float(food_row["iron_mg"]) * factor, 2)
     vit_c = round(float(food_row["vitamin_c_mg"]) * factor, 1)
+    unit_price = int(food_row.get("unit_price_vnd_per_kg", 40000))
+    total_price = int(round((weight_g / 1000.0) * unit_price))
 
     return {
         "matched": True,
@@ -93,6 +98,8 @@ def calculate_nutrition(label: str, weight_gram: float, use_edible_portion: bool
         "weight_gram": round(weight_g, 1),
         "edible_portion_percent": round(edible_pct, 1),
         "edible_gram": round(edible_gram, 1),
+        "unit_price_per_kg": unit_price,
+        "total_price_vnd": total_price,
         "per_100g": {
             "energy_kcal": float(food_row["energy_kcal"]),
             "protein_g": float(food_row["protein_g"]),

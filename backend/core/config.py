@@ -84,14 +84,14 @@ class Settings:
     hx711_sck_pin: int = int(os.getenv("HX711_SCK_PIN", "6"))
     hx711_invert_signal: bool = _parse_bool(os.getenv("HX711_INVERT_SIGNAL"), default=True)
     hx711_zero_band_g: float = float(os.getenv("HX711_ZERO_BAND_G", "0.5"))
-    hx711_median_samples: int = int(os.getenv("HX711_MEDIAN_SAMPLES", "3"))
+    hx711_median_samples: int = int(os.getenv("HX711_MEDIAN_SAMPLES", "15"))
     weight_sample_hz: int = int(os.getenv("WEIGHT_SAMPLE_HZ", "10"))
 
-    # State Machine thresholds (hỗ trợ cả vật nhẹ ~35-60g như 1 quả trứng + chống quay vòng)
+    # State Machine thresholds (ổn định 0.8s với Δm < 2.5g; cần 3 mẫu < 8.0g mới về IDLE)
     idle_weight_g: float = float(os.getenv("IDLE_WEIGHT_G", "8.0"))
     detect_weight_g: float = float(os.getenv("DETECT_WEIGHT_G", "15.0"))
-    stability_delta_g: float = float(os.getenv("STABILITY_DELTA_G", "2.0"))
-    stability_hold_s: float = float(os.getenv("STABILITY_HOLD_S", "1.0"))
+    stability_delta_g: float = float(os.getenv("STABILITY_DELTA_G", "2.5"))
+    stability_hold_s: float = float(os.getenv("STABILITY_HOLD_S", "0.8"))
 
     # LCD I2C PCF8574
     lcd_i2c_address: int = _parse_int_hex(os.getenv("LCD_I2C_ADDRESS"), 0x27)
@@ -110,7 +110,7 @@ class Settings:
 
     # AI Engine
     ai_strategy: str = os.getenv("AI_STRATEGY", "auto").strip().lower()
-    ai_confidence_threshold: float = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.50"))
+    ai_confidence_threshold: float = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.35"))
     ai_nms_iou_threshold: float = float(os.getenv("AI_NMS_IOU_THRESHOLD", "0.45"))
     ai_input_size: int = int(os.getenv("AI_INPUT_SIZE", "416"))
     ai_num_threads: int = int(os.getenv("AI_NUM_THREADS", "4"))

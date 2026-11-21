@@ -80,16 +80,37 @@ def run_ai_tests() -> int:
     fps = 1000.0 / avg_ms if avg_ms > 0 else 0.0
     print(f"  -> Trung bình: {avg_ms:.1f} ms/ảnh (~{fps:.1f} FPS)")
 
-    # 4. Kiểm tra tính toán dinh dưỡng thực tế
-    print("\n[4/4] Kiểm tra quy đổi dinh dưỡng (g -> kcal/protein/fat/carb)...")
+    # 4. Kiểm tra giải mã tensor (68, 3549) & Letterbox 416x416 -> khung hình gốc
+    print("\n[4/5] Kiểm tra giải mã tensor YOLO26n NCNN (68, 3549) + Letterbox 416x416...")
+    from ai_engine.detector import NCNNYoloDetector
+
+    dec = NCNNYoloDetector()
+    test_img = frames[0][1]
+    padded, ratio, pad_x, pad_y = dec._letterbox(test_img, 416)
+    assert padded.shape == (416, 416, 3), f"Letterbox shape sai: {padded.shape}"
+
+    fake_out = np.zeros((68, 3549), dtype=np.float32)
+    # Đặt 1 box giả lập cho lớp 27 (Fish) tại tâm 416x416
+    fake_out[0, 100] = 208.0  # cx
+    fake_out[1, 100] = 208.0  # cy
+    fake_out[2, 100] = 180.0  # w
+    fake_out[3, 100] = 120.0  # h
+    fake_out[4 + 27, 100] = 0.88  # Fish confidence
+    dets = dec._postprocess_yolo(fake_out, test_img.shape[:2], letterbox=(ratio, pad_x, pad_y))
+    assert dets and dets[0]["label"] == "Fish" and dets[0]["confidence"] >= 0.85, f"Decode sai: {dets}"
+    print(f"  - Giải mã chuẩn xác: {dets[0]['label']} ({dets[0]['confidence']*100:.1f}%) bbox={dets[0]['box']}")
+
+    # 5. Kiểm tra tính toán dinh dưỡng & đơn giá thực tế
+    print("\n[5/5] Kiểm tra quy đổi dinh dưỡng (g -> kcal/protein/fat/carb) & đơn giá...")
     init_database()
     nut = calculate_nutrition("Beef", 250.0)
     print(
         f"  - Beef 250g -> {nut['actual']['energy_kcal']} kcal | "
-        f"P={nut['actual']['protein_g']}g | F={nut['actual']['fat_g']}g | C={nut['actual']['carbohydrate_g']}g"
+        f"P={nut['actual']['protein_g']}g | F={nut['actual']['fat_g']}g | C={nut['actual']['carbohydrate_g']}g | "
+        f"Giá={nut['total_price_vnd']:,} đ ({nut['unit_price_per_kg']:,} đ/kg)"
     )
-    if not nut["matched"] or nut["actual"]["energy_kcal"] <= 0:
-        print("[FAIL] Lỗi tính toán dinh dưỡng!")
+    if not nut["matched"] or nut["actual"]["energy_kcal"] <= 0 or nut["total_price_vnd"] <= 0:
+        print("[FAIL] Lỗi tính toán dinh dưỡng / đơn giá!")
         return 1
 
     print("\n[PASS] Module AI & Dinh dưỡng hoạt động chính xác!")

@@ -20,19 +20,19 @@ export class UsersPage {
 
           <form id="create-user-form" style="display:grid; grid-template-columns:1fr 1fr 1.2fr 1fr auto; gap:10px; align-items:end;">
             <div>
-              <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Tên đăng nhập</label>
+              <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Tên đăng nhập</label>
               <input id="u-username" class="input" style="width:100%;" placeholder="vd: beppho1" required />
             </div>
             <div>
-              <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Mật khẩu</label>
+              <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Mật khẩu</label>
               <input id="u-password" type="password" class="input" style="width:100%;" placeholder="Tối thiểu 4 ký tự" required />
             </div>
             <div>
-              <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Họ và tên</label>
+              <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Họ và tên</label>
               <input id="u-fullname" class="input" style="width:100%;" placeholder="Họ tên nhân viên" required />
             </div>
             <div>
-              <label style="display:block; font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Vai trò</label>
+              <label style="display:block; font-size:14px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">Vai trò</label>
               <select id="u-role" class="select" style="width:100%;">
                 <option value="RECEIVER">Nhân viên tiếp nhận (RECEIVER)</option>
                 <option value="CHEF">Đầu bếp trưởng (CHEF)</option>

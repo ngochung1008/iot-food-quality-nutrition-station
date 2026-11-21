@@ -290,6 +290,8 @@ class StationService:
             "confirmed_by": confirmed_by,
             "order_id": order_id or "",
             "order_item_id": order_item_id or "",
+            "unit_price_per_kg": int(nut.get("unit_price_per_kg", 0)),
+            "total_price_vnd": int(nut.get("total_price_vnd", 0)),
         }
 
         insert_intake_log(receipt)

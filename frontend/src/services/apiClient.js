@@ -133,6 +133,11 @@ export const apiClient = {
       method: "POST",
       body: JSON.stringify({ enabled }),
     }),
+  setActiveOrder: (orderId) =>
+    request("/api/station/active-order", {
+      method: "POST",
+      body: JSON.stringify({ order_id: orderId || null }),
+    }),
   simulateWeight: (weightGram) =>
     request("/api/station/simulate/weight", {
       method: "POST",

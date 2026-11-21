@@ -70,6 +70,8 @@ class LoadcellManager:
         self.last_error: str | None = None
 
         self._history: deque[float] = deque(maxlen=20)
+        self._rolling_grams: deque[float] = deque(maxlen=5)
+        self._spike_skip_count: int = 0
         self._stable_since: float | None = None
         self._mock_driver = MockScaleDriver()
 
@@ -115,14 +117,17 @@ class LoadcellManager:
                 f"[LOADCELL] Đã thiết lập GPIO HX711 (DT=GPIO{self.dt_pin}, SCK=GPIO{self.sck_pin}, Invert={self.invert_signal})"
             )
             time.sleep(0.15)
-            self.tare(samples=21)
+            self.tare(samples=15)
         except Exception as exc:
             self.last_error = f"Lỗi khởi tạo GPIO HX711: {exc}"
             self.hardware_available = False
             logger.error(f"[LOADCELL] {self.last_error}")
 
     def load_calibration(self) -> None:
-        """Đọc scale_ratio từ hardware/calibration.json."""
+        """Đọc scale_ratio và tare_offset từ hardware/calibration.json.
+
+        Tuyệt đối không tự ý reset scale_ratio về 420.0 nếu file calibration.json đã tồn tại.
+        """
         cal_file = settings.calibration_file
         if not cal_file.exists():
             self.calibrated = False
@@ -138,7 +143,11 @@ class LoadcellManager:
             if ratio != 0:
                 self.scale_ratio = ratio
                 self.calibrated = True
-                logger.info(f"[LOADCELL] Đã nạp scale_ratio={ratio:.4f} từ {cal_file.name}")
+                if "tare_offset" in data and data["tare_offset"] is not None:
+                    self.offset = float(data["tare_offset"])
+                logger.info(
+                    f"[LOADCELL] Đã nạp scale_ratio={ratio:.4f}, tare_offset={self.offset:.1f} từ {cal_file.name}"
+                )
             else:
                 self.calibrated = False
                 self.last_error = "scale_ratio trong calibration.json bằng 0."
@@ -146,6 +155,40 @@ class LoadcellManager:
             self.calibrated = False
             self.last_error = f"Lỗi đọc calibration.json: {exc}"
             logger.warning(f"[LOADCELL] {self.last_error}")
+
+    def _persist_calibration_file(self, known_weight_g: float | None = None) -> bool:
+        """Ghi scale_ratio hiện tại và tare_offset ổn định vào hardware/calibration.json."""
+        existing: dict[str, Any] = {}
+        cal_file = settings.calibration_file
+        if cal_file.exists():
+            try:
+                with open(cal_file, "r", encoding="utf-8-sig") as f:
+                    existing = json.load(f) or {}
+            except Exception:
+                existing = {}
+
+        # Giữ nguyên scale_ratio thực tế trong file nếu đã có và self.calibrated chưa thay đổi
+        ratio_to_save = self.scale_ratio
+        if ratio_to_save == 0 and float(existing.get("scale_ratio", 0)) != 0:
+            ratio_to_save = float(existing["scale_ratio"])
+
+        payload: dict[str, Any] = {
+            **existing,
+            "scale_ratio": round(float(ratio_to_save), 4),
+            "tare_offset": round(float(self.offset), 1),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if known_weight_g is not None:
+            payload["reference_weight_g"] = float(known_weight_g)
+
+        try:
+            cal_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cal_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as exc:
+            logger.error(f"[LOADCELL] Không thể lưu calibration.json: {exc}")
+            return False
 
     def save_calibration(self, ratio: float, known_weight_g: float | None = None) -> bool:
         """Lưu hệ số hiệu chuẩn vào hardware/calibration.json."""
@@ -156,22 +199,12 @@ class LoadcellManager:
             self.calibrated = True
             self._mock_driver.scale_ratio = self.scale_ratio
 
-        payload: dict[str, Any] = {
-            "scale_ratio": round(float(ratio), 4),
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        if known_weight_g is not None:
-            payload["reference_weight_g"] = float(known_weight_g)
-
-        try:
-            settings.calibration_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(settings.calibration_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-            logger.info(f"[LOADCELL] Đã lưu scale_ratio={self.scale_ratio:.4f} vào calibration.json")
-            return True
-        except Exception as exc:
-            logger.error(f"[LOADCELL] Không thể lưu calibration.json: {exc}")
-            return False
+        ok = self._persist_calibration_file(known_weight_g=known_weight_g)
+        if ok:
+            logger.info(
+                f"[LOADCELL] Đã lưu scale_ratio={self.scale_ratio:.4f}, tare_offset={self.offset:.1f} vào calibration.json"
+            )
+        return ok
 
     def is_ready(self) -> bool:
         """HX711 kéo chân DT xuống LOW khi có mẫu mới sẵn sàng."""
@@ -216,28 +249,43 @@ class LoadcellManager:
 
         return -count if self.invert_signal else count
 
-    def read_median_raw(self, samples: int = 9) -> float:
-        """Lọc gai nhiễu bằng trung vị (Median) qua N mẫu."""
+    @staticmethod
+    def filter_median_outliers(values: list[float] | list[int], tolerance_ratio: float = 0.25) -> float:
+        """Lọc nhiễu: tìm trung vị, loại bỏ ngoại lai lệch quá ±25% so với trung vị rồi tính trung bình."""
+        if not values:
+            raise ValueError("Danh sách mẫu trống.")
+        med = float(statistics.median(values))
+        threshold = max(abs(med) * tolerance_ratio, 150.0)
+        inliers = [float(v) for v in values if abs(float(v) - med) <= threshold]
+        if inliers:
+            return float(statistics.mean(inliers))
+        return med
+
+    def read_median_raw(self, samples: int = 7) -> float:
+        """Đọc N mẫu (mặc định 7), lọc trung vị và loại ngoại lai lệch > ±25% trước khi tính trung bình."""
         if self.mock_mode:
             vals = [self._mock_driver.read_raw_simulated() for _ in range(max(3, min(samples, 11)))]
-            return float(statistics.median(vals))
+            return self.filter_median_outliers(vals)
 
         values: list[int] = []
         for _ in range(samples):
             try:
                 v = self.read_raw()
-                if v not in (0x7FFFFF, -0x800000, -1):
+                if v not in (0x7FFFFF, -0x800000, -1, 0):
                     values.append(v)
             except TimeoutError:
                 pass
-            time.sleep(0.01)
+            time.sleep(0.005)
 
         if not values:
             raise RuntimeError("Mất kết nối HX711 (không đọc được mẫu hợp lệ).")
-        return float(statistics.median(values))
+        return self.filter_median_outliers(values)
 
-    def tare(self, samples: int = 21) -> bool:
-        """Trừ bì (Zero balance): đặt khối lượng nền hiện tại làm điểm 0."""
+    def tare(self, samples: int = 15) -> bool:
+        """Trừ bì (Zero balance): lấy trung vị 15 mẫu sạch làm mốc tare_offset = 0.0g.
+
+        Tuyệt đối không ghi đè file hardware/calibration.json nếu đã tồn tại.
+        """
         if self.mock_mode:
             self.offset = self._mock_driver.tare()
             with self._lock:
@@ -245,6 +293,8 @@ class LoadcellManager:
                 self.current_weight = 0.0
                 self.is_stable = False
                 self._history.clear()
+                self._rolling_grams.clear()
+                self._spike_skip_count = 0
                 self._stable_since = None
             logger.info("[LOADCELL MOCK] Đã Tare cân về 0.0g")
             return True
@@ -260,8 +310,10 @@ class LoadcellManager:
                 self.current_weight = 0.0
                 self.is_stable = False
                 self._history.clear()
+                self._rolling_grams.clear()
+                self._spike_skip_count = 0
                 self._stable_since = None
-            logger.info(f"[LOADCELL] Đã Tare thành công (offset={self.offset:.1f})")
+            logger.info(f"[LOADCELL] Đã Tare 15 mẫu thành công (tare_offset={self.offset:.1f})")
             return True
         except Exception as exc:
             self.last_error = f"Tare thất bại: {exc}"
@@ -323,17 +375,18 @@ class LoadcellManager:
         return 0.0 if grams < self.zero_band_g else float(grams)
 
     def _reader_loop(self) -> None:
-        """Luồng đọc nền liên tục mỗi ~100ms (10Hz)."""
+        """Luồng đọc nền 10Hz với bộ lọc trượt Rolling Median 5 mẫu & loại gai nhiễu đột biến."""
         interval = 1.0 / max(1, settings.weight_sample_hz)
         while not self._stop_event.is_set():
             started = time.time()
             try:
                 if self.mock_mode or (self.hardware_available and HAS_RPI_GPIO):
-                    # Dùng 3 mẫu trung vị ở luồng nền để tăng tốc độ phản hồi ~3 lần
-                    grams = self.get_grams(samples=3)
+                    # Đọc 3 mẫu sạch mỗi nhịp 100ms rồi đưa qua Rolling Median 5 mẫu
+                    sample_g = self.get_grams(samples=3)
                     now = time.time()
                     with self._lock:
-                        self.last_grams = round(abs(grams), 1)
+                        smooth_g = self._apply_rolling_median_filter(sample_g)
+                        self.last_grams = round(abs(smooth_g), 1)
                         self.last_sample_time = now
                         self.scale_online = True
                         self.last_error = None
@@ -353,7 +406,22 @@ class LoadcellManager:
                 time.sleep(0.05)
 
             elapsed = time.time() - started
-            time.sleep(max(0.02, interval - elapsed))
+            time.sleep(max(0.01, interval - elapsed))
+
+    def _apply_rolling_median_filter(self, sample_g: float) -> float:
+        """Bộ lọc trượt Rolling Median 5 mẫu loại bỏ gai nhảy gấp đôi hoặc rớt về 0 bất thường."""
+        val = max(0.0, float(sample_g))
+        if len(self._rolling_grams) >= 3:
+            med = float(statistics.median(self._rolling_grams))
+            is_double_spike = med >= 15.0 and val >= med * 1.85 and (val - med) > 25.0
+            is_zero_dropout = med >= 15.0 and val < 2.0
+            if (is_double_spike or is_zero_dropout) and self._spike_skip_count < 2:
+                self._spike_skip_count += 1
+                return med
+        self._spike_skip_count = 0
+        self._rolling_grams.append(val)
+        out = float(statistics.median(self._rolling_grams))
+        return 0.0 if out < self.zero_band_g else out
 
     def _update_stability(self, weight: float, now: float) -> None:
         """Kiểm tra cân ổn định khi Δm < STABILITY_DELTA_G trong STABILITY_HOLD_S giây."""
@@ -392,6 +460,9 @@ class LoadcellManager:
         val = round(max(0.0, float(grams)), 1)
         self._mock_driver.set_weight(val)
         with self._lock:
+            self._rolling_grams.clear()
+            self._rolling_grams.append(val)
+            self._spike_skip_count = 0
             self.last_grams = val
             self.current_weight = val
             self.last_sample_time = time.time()

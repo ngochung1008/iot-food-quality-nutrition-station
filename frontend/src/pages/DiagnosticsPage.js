@@ -25,25 +25,25 @@ export class DiagnosticsPage {
             <div style="display:flex; flex-direction:column; gap:12px;">
               <div style="padding:12px; background:var(--bg-muted); border-radius:var(--radius); border:1px solid var(--border-light);">
                 <strong>Bước 1: Lấy điểm 0 (Tare)</strong>
-                <p style="margin:6px 0 10px; font-size:13px; color:var(--text-secondary);">
+                <p style="margin:6px 0 10px; font-size:15px; color:var(--text-secondary);">
                   Đảm bảo đĩa cân đang <strong>trống hoàn toàn</strong>, sau đó nhấn nút bên dưới để lấy 21 mẫu trung vị làm điểm 0.
                 </p>
                 <button id="btn-cal-tare" class="btn btn-outline" type="button">Bước 1: Thực hiện Tare (Lấy điểm 0)</button>
-                <div id="cal-step1-msg" style="margin-top:8px; font-size:13px; font-weight:600; color:var(--brand);"></div>
+                <div id="cal-step1-msg" style="margin-top:8px; font-size:15px; font-weight:600; color:var(--brand);"></div>
               </div>
 
               <div style="padding:12px; background:var(--bg-muted); border-radius:var(--radius); border:1px solid var(--border-light);">
                 <strong>Bước 2: Đặt vật mẫu chuẩn &amp; Tính hệ số scale_ratio</strong>
-                <p style="margin:6px 0 10px; font-size:13px; color:var(--text-secondary);">
+                <p style="margin:6px 0 10px; font-size:15px; color:var(--text-secondary);">
                   Đặt quả cân chuẩn đã biết khối lượng (ví dụ 500g) lên tâm đĩa cân rồi nhấn Đo &amp; Lưu.
                 </p>
                 <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
                   <input id="cal-known-weight" type="number" class="input" style="width:140px;" value="500" min="10" step="1" />
-                  <span style="font-weight:700; font-size:13px;">gram</span>
+                  <span style="font-weight:700; font-size:15px;">gram</span>
                   <button id="btn-cal-measure" class="btn btn-primary" type="button">Bước 2: Đo vật mẫu &amp; Lưu</button>
                   <button id="btn-cal-invert" class="btn btn-outline" type="button">Đảo dấu</button>
                 </div>
-                <div id="cal-step2-msg" style="margin-top:8px; font-size:13px; font-weight:600; color:var(--success);"></div>
+                <div id="cal-step2-msg" style="margin-top:8px; font-size:15px; font-weight:600; color:var(--success);"></div>
               </div>
             </div>
           </div>
@@ -56,7 +56,7 @@ export class DiagnosticsPage {
 
             <div style="display:flex; flex-direction:column; gap:12px;">
               <div>
-                <label style="display:block; font-size:12.5px; font-weight:700; margin-bottom:4px;">Gửi thông điệp kiểm tra ra LCD 16x2:</label>
+                <label style="display:block; font-size:14.5px; font-weight:700; margin-bottom:4px;">Gửi thông điệp kiểm tra ra LCD 16x2:</label>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
                   <input id="lcd-test-l1" class="input" maxlength="16" value="TEST LCD PI4 OK" placeholder="Dòng 1 (16 ký tự)" />
                   <input id="lcd-test-l2" class="input" maxlength="16" value="FRESHKITCHEN AI" placeholder="Dòng 2 (16 ký tự)" />
@@ -67,7 +67,7 @@ export class DiagnosticsPage {
               <hr style="border:none; border-top:1px solid var(--border-light); width:100%;" />
 
               <div>
-                <label style="display:block; font-size:12.5px; font-weight:700; margin-bottom:4px;">
+                <label style="display:block; font-size:14.5px; font-weight:700; margin-bottom:4px;">
                   Mã PIN bổ sung (nếu server cấu hình <code>ADMIN_PIN</code>):
                 </label>
                 <div style="display:flex; gap:8px;">

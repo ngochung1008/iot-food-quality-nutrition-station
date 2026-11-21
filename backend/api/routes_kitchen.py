@@ -45,6 +45,7 @@ class CreateOrderRequest(BaseModel):
     dish_ids: list[int] = Field(..., min_length=1)
     note: str = Field(default="")
     tolerance_percent: float = Field(default=5.0, ge=0.0, le=30.0)
+    target_kcal_per_serving: float = Field(default=650.0, ge=100.0, le=5000.0)
 
 
 class CheckOrderItemRequest(BaseModel):
@@ -110,6 +111,7 @@ def create_order(body: CreateOrderRequest, user: dict = Depends(get_current_user
             created_by=user.get("full_name", user.get("username", "chef")),
             note=body.note,
             tolerance_percent=body.tolerance_percent,
+            target_kcal_per_serving=body.target_kcal_per_serving,
         )
         station_service._on_station_event("order_created", {"order": order})
         return order

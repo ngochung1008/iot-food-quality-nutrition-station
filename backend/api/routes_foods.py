@@ -24,6 +24,7 @@ class FoodUpdateRequest(BaseModel):
     calcium_mg: float | None = None
     iron_mg: float | None = None
     vitamin_c_mg: float | None = None
+    unit_price_vnd_per_kg: int | None = None
     is_active: bool | None = None
 
 

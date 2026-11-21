@@ -84,21 +84,21 @@ def draw_detections(frame: np.ndarray, detections: list[dict[str, Any]]) -> np.n
         elif quality == QualityStatus.WARNING.value:
             color = (11, 158, 245)    # Cam BGR: Cần kiểm tra
         else:
-            color = (80, 195, 22)     # Xanh lá BGR: Tươi đạt chuẩn
+            color = (50, 205, 50)     # Xanh lá tươi BGR: Đạt chuẩn
 
-        x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        x1, y1, x2, y2 = int(box["x1"]), int(box["y1"]), int(box["x2"]), int(box["y2"])
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 3)
 
-        caption = f"{label} {conf * 100:.0f}%"
-        (tw, th), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
-        bg_y1 = max(0, y1 - th - 10)
-        cv2.rectangle(out, (x1, bg_y1), (min(out.shape[1], x1 + tw + 10), y1), color, -1)
+        caption = f"{label} - {conf * 100:.0f}%"
+        (tw, th), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        bg_y1 = max(0, y1 - th - 12)
+        cv2.rectangle(out, (x1, bg_y1), (min(out.shape[1], x1 + tw + 12), y1), color, -1)
         cv2.putText(
             out,
             caption,
-            (x1 + 5, max(th + 2, y1 - 5)),
+            (x1 + 6, max(th + 4, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
+            0.6,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
@@ -346,16 +346,42 @@ class NCNNYoloDetector(BaseAIDetector):
         out = self._cv_dnn_net.forward()
         return self._postprocess_yolo(out, (h_orig, w_orig))
 
+    @staticmethod
+    def _letterbox(frame: np.ndarray, target_size: int) -> tuple[np.ndarray, float, float, float]:
+        """Resize giữ nguyên tỷ lệ kèm viền xám (114, 114, 114) chuẩn Ultralytics YOLO."""
+        h_orig, w_orig = frame.shape[:2]
+        ratio = min(target_size / float(h_orig), target_size / float(w_orig))
+        new_w = int(round(w_orig * ratio))
+        new_h = int(round(h_orig * ratio))
+        dw = (target_size - new_w) / 2.0
+        dh = (target_size - new_h) / 2.0
+
+        if (w_orig, h_orig) != (new_w, new_h):
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            resized = frame
+
+        top = int(round(dh - 0.1))
+        bottom = int(round(dh + 0.1))
+        left = int(round(dw - 0.1))
+        right = int(round(dw + 0.1))
+        padded = cv2.copyMakeBorder(
+            resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)
+        )
+        if padded.shape[0] != target_size or padded.shape[1] != target_size:
+            padded = cv2.resize(padded, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+        return np.ascontiguousarray(padded, dtype=np.uint8), ratio, float(left), float(top)
+
     def _infer_ncnn_native(self, frame: np.ndarray) -> list[dict[str, Any]]:
-        """Tiền xử lý letterbox/resize -> suy luận NCNN (in0 -> out0) -> NMS."""
+        """Tiền xử lý letterbox 416x416 -> suy luận NCNN (in0 -> out0) -> giải mã & NMS."""
         import ncnn  # type: ignore
 
         h_orig, w_orig = frame.shape[:2]
-        mat_in = ncnn.Mat.from_pixels_resize(
-            frame,
+        padded, ratio, pad_x, pad_y = self._letterbox(frame, self.input_size)
+
+        mat_in = ncnn.Mat.from_pixels(
+            padded,
             ncnn.Mat.PixelType.PIXEL_BGR2RGB,
-            w_orig,
-            h_orig,
             self.input_size,
             self.input_size,
         )
@@ -368,38 +394,69 @@ class NCNNYoloDetector(BaseAIDetector):
         if ret != 0:
             return []
 
-        return self._postprocess_yolo(np.array(mat_out), (h_orig, w_orig))
+        raw_out = np.array(mat_out)
+        return self._postprocess_yolo(raw_out, (h_orig, w_orig), letterbox=(ratio, pad_x, pad_y))
 
-    def _postprocess_yolo(self, output: np.ndarray, frame_shape: tuple[int, int]) -> list[dict[str, Any]]:
-        """Giải mã tensor đầu ra (68, 3549) của YOLO26n và lọc trùng bằng NMS."""
+    def _postprocess_yolo(
+        self,
+        output: np.ndarray,
+        frame_shape: tuple[int, int],
+        letterbox: tuple[float, float, float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Giải mã tensor đầu ra (68, 3549) của YOLO26n về tọa độ khung hình gốc & lọc NMS."""
         out = np.squeeze(output)
         if out.ndim != 2:
             return []
-        if out.shape[0] < out.shape[1]:
-            out = out.T  # -> (3549, 68)
+        # Ultralytics YOLO NCNN trả về (4 + num_classes, 3549) -> chuyển về (3549, 68)
+        if out.shape[0] in (4 + self.num_classes, 68) or out.shape[0] < out.shape[1]:
+            out = out.T
 
-        h_orig, w_orig = frame_shape[:2]
-        scale_x = w_orig / float(self.input_size)
-        scale_y = h_orig / float(self.input_size)
-
-        boxes: list[list[int]] = []
-        confidences: list[float] = []
-        class_ids: list[int] = []
-
-        # Lọc nhanh theo ngưỡng confidence bằng NumPy vectorized trước khi vào vòng lặp
         if out.shape[1] < 5:
             return []
+
+        h_orig, w_orig = frame_shape[:2]
+        # Tự động xử lý nếu tọa độ bbox bị chuẩn hóa [0..1]
+        coords_max = float(np.max(out[:, :4])) if out.size else 0.0
+        coord_mul = float(self.input_size) if 0.0 < coords_max <= 2.0 else 1.0
+
         scores_matrix = out[:, 4:]
         best_cls_ids = np.argmax(scores_matrix, axis=1)
         best_confs = scores_matrix[np.arange(out.shape[0]), best_cls_ids]
         valid_mask = best_confs >= self.conf_threshold
 
+        boxes: list[list[int]] = []
+        confidences: list[float] = []
+        class_ids: list[int] = []
+
         for row, cls_id, conf in zip(out[valid_mask], best_cls_ids[valid_mask], best_confs[valid_mask]):
-            cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-            x1 = int((cx - bw / 2.0) * scale_x)
-            y1 = int((cy - bh / 2.0) * scale_y)
-            box_w = int(bw * scale_x)
-            box_h = int(bh * scale_y)
+            cx = float(row[0]) * coord_mul
+            cy = float(row[1]) * coord_mul
+            bw = float(row[2]) * coord_mul
+            bh = float(row[3]) * coord_mul
+
+            if letterbox is not None:
+                ratio, pad_x, pad_y = letterbox
+                x1_f = (cx - bw / 2.0 - pad_x) / ratio
+                y1_f = (cy - bh / 2.0 - pad_y) / ratio
+                x2_f = (cx + bw / 2.0 - pad_x) / ratio
+                y2_f = (cy + bh / 2.0 - pad_y) / ratio
+            else:
+                sx = w_orig / float(self.input_size)
+                sy = h_orig / float(self.input_size)
+                x1_f = (cx - bw / 2.0) * sx
+                y1_f = (cy - bh / 2.0) * sy
+                x2_f = (cx + bw / 2.0) * sx
+                y2_f = (cy + bh / 2.0) * sy
+
+            x1 = max(0, min(w_orig - 1, int(round(x1_f))))
+            y1 = max(0, min(h_orig - 1, int(round(y1_f))))
+            x2 = max(0, min(w_orig, int(round(x2_f))))
+            y2 = max(0, min(h_orig, int(round(y2_f))))
+            box_w = x2 - x1
+            box_h = y2 - y1
+            if box_w <= 2 or box_h <= 2:
+                continue
+
             boxes.append([x1, y1, box_w, box_h])
             confidences.append(float(conf))
             class_ids.append(int(cls_id))
@@ -415,17 +472,13 @@ class NCNNYoloDetector(BaseAIDetector):
         for idx in indices:
             i = int(idx[0]) if isinstance(idx, (list, tuple, np.ndarray)) else int(idx)
             x1, y1, box_w, box_h = boxes[i]
-            x2 = min(w_orig, max(0, x1 + box_w))
-            y2 = min(h_orig, max(0, y1 + box_h))
-            x1 = max(0, min(w_orig - 1, x1))
-            y1 = max(0, min(h_orig - 1, y1))
             cls_id = class_ids[i]
             detections.append(
                 {
                     "class_id": cls_id,
                     "label": self.class_names.get(cls_id, f"class_{cls_id}"),
                     "confidence": round(confidences[i], 3),
-                    "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "box": {"x1": x1, "y1": y1, "x2": x1 + box_w, "y2": y1 + box_h},
                 }
             )
 
@@ -495,6 +548,8 @@ def _pack_prediction(
         "detected_class": label,
         "quality_status": quality_status,
         "confidence": round(confidence, 3),
+        "confidence_percent": round(confidence * 100.0, 1),
+        "bbox": best.get("box"),
         "inference_time_ms": inference_time_ms,
         "fps": fps,
         "detections": detections,
