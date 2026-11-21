@@ -115,10 +115,14 @@ export const apiClient = {
       method: "POST",
       body: JSON.stringify({ item_id: itemId, override_class: overrideClass, note }),
     }),
+  resetOrder: (orderId) =>
+    request(`/api/kitchen/orders/${orderId}/reset`, { method: "POST" }),
 
   // Station
   getState: () => request("/api/station/state"),
   tare: () => request("/api/station/tare", { method: "POST" }),
+  resetStation: (payload = {}) =>
+    request("/api/station/reset", { method: "POST", body: JSON.stringify(payload) }),
   inspectNow: (payload = {}) =>
     request("/api/station/inspect", { method: "POST", body: JSON.stringify(payload) }),
   commitReceipt: (payload = {}) =>

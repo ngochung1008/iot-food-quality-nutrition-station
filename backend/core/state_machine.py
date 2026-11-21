@@ -63,6 +63,7 @@ class NutritionStationStateMachine:
                 "auto_commit": self.auto_commit,
                 "active_order_id": self.active_order_id,
                 "current_inspection": self.current_inspection,
+                "latest_inspection": self.current_inspection,
                 "last_committed_receipt": self.last_committed_receipt,
                 "ts": time.time(),
             }
@@ -77,40 +78,69 @@ class NutritionStationStateMachine:
             self.active_order_id = order_id.strip() if order_id else None
             return self.active_order_id
 
-    def reset_after_tare(self) -> dict[str, Any]:
-        """Đưa ngay State Machine về IDLE sau khi người dùng bấm Tare / Về 0g."""
+    def reset_session(self) -> dict[str, Any]:
+        """Reset toàn bộ phiên cân về IDLE, xóa kết quả AI và khung bounding box trên camera."""
         with self._lock:
             self.state = StationState.IDLE
             self.current_inspection = None
             self._below_idle_count = 0
             self.scale.station_state = self.state.value
+            if hasattr(self.scale, "reset_stability"):
+                self.scale.reset_stability()
             if self.camera:
                 self.camera.set_overlay_detections([])
             snap = self.snapshot()
         self._emit("state_change", snap)
         return snap
 
+    def reset_after_tare(self) -> dict[str, Any]:
+        """Đưa ngay State Machine về IDLE sau khi người dùng bấm Tare / Về 0g."""
+        return self.reset_session()
+
+    def _clear_to_idle_locked(self) -> None:
+        """Reset sạch phiên cân & xóa bounding box khi đĩa cân trống (< idle_weight_g)."""
+        self.state = StationState.IDLE
+        self.current_inspection = None
+        self._below_idle_count = 0
+        if self.camera:
+            self.camera.set_overlay_detections([])
+
     def update(self) -> str:
         """Cập nhật một chu kỳ State Machine (gọi 10 lần/giây)."""
         w = self.scale.read_filtered_weight()
         need_inspect = False
+        cleared_to_idle = False
         with self._lock:
             prev = self.state
             self.scale.station_state = self.state.value
             if self.state == StationState.IDLE:
-                self._below_idle_count = 0
                 if w >= settings.detect_weight_g:
+                    self._below_idle_count = 0
+                    self.current_inspection = None
+                    if self.camera:
+                        self.camera.set_overlay_detections([])
                     self.state = StationState.STABILIZING
                     logger.info(f"[STATE] Phát hiện khay thực phẩm ({w:.1f}g) -> STABILIZING")
+                elif w < settings.idle_weight_g and self.current_inspection is not None:
+                    # Nếu trước đó có kết quả cân vật thật (không phải ép quét thủ công lúc 0g) mà cân đã trống -> xóa sạch
+                    if not self.current_inspection.get("manual_empty"):
+                        self._below_idle_count += 1
+                        if self._below_idle_count >= 3:
+                            self._clear_to_idle_locked()
+                            cleared_to_idle = True
+                    else:
+                        self._below_idle_count = 0
+                else:
+                    self._below_idle_count = 0
 
             elif self.state == StationState.STABILIZING:
                 if w < settings.idle_weight_g:
                     self._below_idle_count += 1
                     # Cần ít nhất 3 lần đọc liên tiếp < 8.0g mới reset về IDLE (chống 1 mẫu nhiễu 0g)
                     if self._below_idle_count >= 3:
-                        self.state = StationState.IDLE
-                        self._below_idle_count = 0
-                        logger.info("[STATE] Cân trống (3 mẫu < 8.0g) -> IDLE")
+                        self._clear_to_idle_locked()
+                        cleared_to_idle = True
+                        logger.info("[STATE] Cân trống (3 mẫu < 8.0g) -> IDLE (đã xóa kết quả AI & bbox)")
                 else:
                     self._below_idle_count = 0
                     if self.scale.is_stable:
@@ -119,17 +149,20 @@ class NutritionStationStateMachine:
                         logger.info(f"[STATE] Trọng lượng ổn định {w:.1f}g -> INSPECTING")
 
             elif self.state == StationState.INSPECTING:
-                pass
+                if w < settings.idle_weight_g:
+                    self._below_idle_count += 1
+                    if self._below_idle_count >= 3:
+                        self._clear_to_idle_locked()
+                        cleared_to_idle = True
+                        logger.info("[STATE] Nhấc vật khi đang INSPECTING -> IDLE")
 
             elif self.state == StationState.CHECKOUT:
                 if w < settings.idle_weight_g:
                     self._below_idle_count += 1
                     if self._below_idle_count >= 3:
-                        logger.info("[STATE] Đã nhấc thực phẩm khỏi cân (3 mẫu < 8.0g) -> IDLE")
-                        self.current_inspection = None
-                        self.state = StationState.IDLE
-                        self._below_idle_count = 0
-                        self.camera.set_overlay_detections([])
+                        logger.info("[STATE] Đã nhấc thực phẩm khỏi cân (3 mẫu < 8.0g) -> IDLE (đã xóa kết quả AI & bbox)")
+                        self._clear_to_idle_locked()
+                        cleared_to_idle = True
                 else:
                     self._below_idle_count = 0
 
@@ -139,7 +172,16 @@ class NutritionStationStateMachine:
             if self.lcd:
                 self.lcd.display_station_status(StationState.INSPECTING.value, w)
             self._emit("state_change", self.snapshot())
-            self.run_inspection(weight_gram=w)
+            try:
+                self.run_inspection(weight_gram=w)
+            except Exception as exc:
+                logger.exception(f"[STATE] Lỗi run_inspection tự động: {exc}")
+                with self._lock:
+                    if self.scale.read_filtered_weight() < settings.idle_weight_g:
+                        self._clear_to_idle_locked()
+                    else:
+                        self.state = StationState.CHECKOUT
+                self._emit("state_change", self.snapshot())
 
         # Cập nhật LCD 16x2 (hiển thị tên thực phẩm + khối lượng nếu đã có kết quả nhận diện)
         if self.lcd:
@@ -150,7 +192,7 @@ class NutritionStationStateMachine:
             display_state = StationState.CHECKOUT.value if (insp and self.state == StationState.IDLE) else self.state.value
             self.lcd.display_station_status(display_state, w, food_name=food_name, kcal=kcal, quality_status=qual)
 
-        if self.state != prev and not need_inspect:
+        if (self.state != prev or cleared_to_idle) and not need_inspect:
             self._emit("state_change", self.snapshot())
 
         return self.state.value
@@ -235,6 +277,7 @@ class NutritionStationStateMachine:
             "quality": quality,
             "nutrition": nutrition,
             "committed": False,
+            "manual_empty": bool(weight_gram is None and w < settings.idle_weight_g),
         }
 
         with self._lock:

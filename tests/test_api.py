@@ -67,6 +67,32 @@ def test_loadcell_outlier_filter_and_state_hysteresis():
     # Mẫu thứ 3 < 8.0g -> mới về IDLE
     assert sm.update() == StationState.IDLE.value
 
+    # 3. Tự động nhận diện khi ổn định & Tự động xóa sạch latest_inspection + bbox khi nhấc vật (< 8.0g)
+    overlay_history = []
+    cam = _DummyCam()
+    cam.set_overlay_detections = lambda dets: overlay_history.append(list(dets))
+    sm2 = NutritionStationStateMachine(scale=scale, camera=cam, detector=_DummyDetector(), lcd=None)
+
+    scale.current_weight = 52.0
+    scale.is_stable = False
+    assert sm2.update() == StationState.STABILIZING.value
+
+    scale.is_stable = True
+    assert sm2.update() == StationState.CHECKOUT.value
+    assert sm2.snapshot()["current_inspection"] is not None
+    assert sm2.snapshot()["latest_inspection"] is not None
+
+    # Nhấc vật ra (< 8.0g x 3 lần) -> về IDLE & xóa sạch current_inspection, latest_inspection, bbox
+    scale.current_weight = 0.0
+    scale.is_stable = False
+    assert sm2.update() == StationState.CHECKOUT.value
+    assert sm2.update() == StationState.CHECKOUT.value
+    assert sm2.update() == StationState.IDLE.value
+    snap_idle = sm2.snapshot()
+    assert snap_idle["current_inspection"] is None
+    assert snap_idle["latest_inspection"] is None
+    assert overlay_history[-1] == []
+
 
 def test_loadcell_auto_zero_drift_and_startup_tare():
     """Kiểm tra khởi động _init_gpio (0.5s + tare 21 mẫu) và Auto-Zero Drift Tracking 0.1g..3.5g trong 3.0s."""
@@ -312,7 +338,23 @@ def _run_e2e_test_body():
         d2_ord = r_ord_done.json()
         assert d2_ord["status"] == "COMPLETED"
         assert d2_ord["progress"]["completed"] == 2
+        assert 1980.0 <= d2_ord["actual_summary"]["total_gram"] <= 2000.0
+        assert d2_ord["actual_summary"]["total_cost_vnd"] > 0
+        assert d2_ord["actual_summary"]["total_kcal"] > 0
         log2_id = next(i["log_id"] for i in d2_ord["items"] if i["id"] == tomato_item["id"])
+
+        # Kiểm tra nút Reset phiên & Reset phiếu hoàn thành để demo lại
+        r_reset_station = client.post("/api/station/reset", json={"reset_order": True, "order_id": order_id})
+        assert r_reset_station.status_code == 200
+        rs_json = r_reset_station.json()
+        assert rs_json["snapshot"]["state"] == "IDLE"
+        assert rs_json["snapshot"]["latest_inspection"] is None
+        assert rs_json["order"]["status"] == "PENDING"
+        assert rs_json["order"]["progress"]["completed"] == 0
+
+        r_reset_order = client.post(f"/api/kitchen/orders/{order_id}/reset", headers=recv_hdr)
+        assert r_reset_order.status_code == 200
+        assert r_reset_order.json()["order"]["progress"]["completed"] == 0
 
         # 6. Báo cáo, Export CSV/XLSX & Calibration (Admin)
         # Kiểm tra nút Tare / Về 0g đặt nắp nhôm (230g) -> đưa ngay về 0.0g & IDLE

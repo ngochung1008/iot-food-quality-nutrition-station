@@ -44,6 +44,11 @@ class SimulateAIRequest(BaseModel):
     quality: str | None = None
 
 
+class ResetSessionRequest(BaseModel):
+    reset_order: bool = False
+    order_id: str | None = None
+
+
 @router.get("/state")
 def get_station_state():
     """Trả về trạng thái thời gian thực hiện tại của trạm cân."""
@@ -63,6 +68,23 @@ def tare_scale():
         "scale_online": station_service.scale.scale_online,
         "snapshot": snap,
     }
+
+
+@router.post("/reset")
+def reset_station_session(body: ResetSessionRequest | None = None):
+    """Reset toàn bộ phiên cân về IDLE, xóa bounding box + kết quả AI cũ (tùy chọn reset phiếu đang chọn)."""
+    req = body or ResetSessionRequest()
+    snap = station_service.state_machine.reset_session()
+    updated_order = None
+    if req.reset_order:
+        from backend.database.crud import reset_procurement_order
+
+        target_order_id = req.order_id or station_service.state_machine.active_order_id
+        if target_order_id:
+            updated_order = reset_procurement_order(target_order_id)
+            if updated_order:
+                station_service._on_station_event("order_updated", {"order": updated_order})
+    return {"ok": True, "snapshot": snap, "order": updated_order}
 
 
 @router.post("/inspect")

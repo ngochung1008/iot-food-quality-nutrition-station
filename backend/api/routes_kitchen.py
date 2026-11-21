@@ -19,6 +19,7 @@ from backend.database.crud import (
     get_procurement_order,
     list_dishes,
     list_procurement_orders,
+    reset_procurement_order,
 )
 from backend.services.station_service import station_service
 
@@ -136,3 +137,14 @@ def check_and_complete_order_item(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/orders/{order_id}/reset", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF, ROLE_RECEIVER))])
+def reset_order_checklist(order_id: str):
+    """Đặt lại toàn bộ tích xanh của phiếu về PENDING để demo lặp lại."""
+    updated = reset_procurement_order(order_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Không tìm thấy phiếu yêu cầu.")
+    snap = station_service.state_machine.reset_session()
+    station_service._on_station_event("order_updated", {"order": updated})
+    return {"ok": True, "order": updated, "snapshot": snap}

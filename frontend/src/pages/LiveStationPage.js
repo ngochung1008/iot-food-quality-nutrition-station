@@ -53,11 +53,11 @@ export class LiveStationPage {
         <!-- Cột phải (45%): Danh Sách Nguyên Liệu Cần Nhập (Từ Nhà Bếp) -->
         <div class="col-stack">
           <div class="card">
-            <div class="card-head">
+            <div class="card-head" style="flex-direction:column; align-items:stretch; gap:12px;">
               <h3 class="card-title">Danh Sách Nguyên Liệu Cần Nhập</h3>
-              <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                <select id="station-order-select" class="select" style="min-height:40px; min-width:220px;"></select>
-                <button id="btn-reload-orders" class="btn btn-sm btn-outline" type="button">Tải lại</button>
+              <div class="order-picker-bar">
+                <select id="station-order-select" class="select order-picker-select"></select>
+                <button id="btn-reload-orders" class="btn btn-sm btn-outline" style="flex-shrink:0;" type="button">Tải lại</button>
               </div>
             </div>
 
@@ -65,7 +65,7 @@ export class LiveStationPage {
             <div id="order-banner-slot"></div>
 
             <div class="table-wrap">
-              <table>
+              <table class="checklist-table">
                 <thead>
                   <tr>
                     <th>Tích</th>
@@ -169,13 +169,87 @@ export class LiveStationPage {
     `;
 
     if (isDone) {
+      const actualSum = order.actual_summary || {};
+      const sumGram =
+        actualSum.total_gram ??
+        order.items.reduce((acc, it) => acc + (it.status === "COMPLETED" ? Number(it.actual_gram || 0) : 0), 0);
+      const sumCost =
+        actualSum.total_cost_vnd ??
+        order.items.reduce(
+          (acc, it) =>
+            acc +
+            (it.status === "COMPLETED"
+              ? Math.round((Number(it.actual_gram || 0) / 1000) * Number(it.unit_price_per_kg || 40000))
+              : 0),
+          0
+        );
+      const sumKcal = actualSum.total_kcal || order.total_kcal || 0;
+      const nextOrder = this.orders.find(
+        (o) => o.id !== order.id && o.status !== "COMPLETED"
+      );
+
       bannerSlot.innerHTML = `
-        <div class="status-banner success">
-          <div style="font-size:18px; font-weight:800;">ĐÃ NHẬP ĐỦ NGUYÊN LIỆU CHO BẾP</div>
-          <div style="font-size:15px; margin-top:4px;">
-            Toàn bộ ${order.progress.total} nguyên liệu trong phiếu đã được kiểm định đạt chuẩn và lưu vào hệ thống.
+        <div class="completion-banner">
+          <div style="font-size:19px; font-weight:800; color:#14532D;">
+            ĐÃ NHẬP ĐỦ 100% NGUYÊN LIỆU CHO BẾP
+          </div>
+          <div style="font-size:15px; margin-top:4px; color:#166534;">
+            Toàn bộ ${order.progress.total}/${order.progress.total} nguyên liệu trong phiếu đã được kiểm định đạt chuẩn và tích xanh hoàn tất.
+          </div>
+
+          <div class="completion-metrics">
+            <div class="completion-metric-box">
+              <div style="font-size:14px; color:var(--text-muted); font-weight:600;">Tổng khối lượng thực nhập</div>
+              <div class="tabular-nums" style="font-size:17px; font-weight:800; color:#0F172A;">
+                ${Number(sumGram).toLocaleString("vi-VN")} g
+              </div>
+            </div>
+            <div class="completion-metric-box">
+              <div style="font-size:14px; color:var(--text-muted); font-weight:600;">Tổng thành tiền</div>
+              <div class="tabular-nums" style="font-size:17px; font-weight:800; color:var(--brand);">
+                ${Number(sumCost).toLocaleString("vi-VN")} đ
+              </div>
+            </div>
+            <div class="completion-metric-box">
+              <div style="font-size:14px; color:var(--text-muted); font-weight:600;">Tổng Calo đã tiếp nhận</div>
+              <div class="tabular-nums" style="font-size:17px; font-weight:800; color:#0F172A;">
+                ${Number(sumKcal).toLocaleString("vi-VN")} kcal
+              </div>
+            </div>
+          </div>
+
+          <div class="completion-actions">
+            <button id="btn-next-order" class="btn btn-sm btn-green" type="button" ${nextOrder ? "" : "disabled"}>
+              ${nextOrder ? "Chuyển sang phiếu tiếp theo" : "Không còn phiếu chờ"}
+            </button>
+            <button id="btn-demo-reset-order" class="btn btn-sm btn-outline" type="button">
+              Reset phiếu này để demo lại
+            </button>
           </div>
         </div>`;
+
+      document.getElementById("btn-next-order")?.addEventListener("click", () => {
+        if (!nextOrder) return;
+        this.activeOrderId = nextOrder.id;
+        this.lastOrderStatus = nextOrder.status;
+        apiClient.setActiveOrder(this.activeOrderId).catch(() => {});
+        this._renderOrderSelector();
+        this._renderOrderChecklist();
+        this.toast(`Đã chuyển sang phiếu: ${nextOrder.title}`, "info");
+      });
+
+      document.getElementById("btn-demo-reset-order")?.addEventListener("click", async () => {
+        try {
+          const res = await apiClient.resetOrder(order.id);
+          this.lastInspectionCode = null;
+          this.lastOrderStatus = "PENDING";
+          if (res?.order) this.onOrderEvent(res.order);
+          if (res?.snapshot) this.update(res.snapshot, true);
+          this.toast("Đã reset phiếu về 0% để demo lại.", "success");
+        } catch (err) {
+          this.toast(err.message, "error");
+        }
+      });
     } else {
       bannerSlot.innerHTML = "";
     }
@@ -308,6 +382,7 @@ export class LiveStationPage {
     document.getElementById("btn-tare")?.addEventListener("click", async () => {
       try {
         const res = await apiClient.tare();
+        this.lastInspectionCode = null;
         if (res?.snapshot) {
           this.update(res.snapshot, true);
         }
@@ -315,6 +390,54 @@ export class LiveStationPage {
       } catch (e) {
         this.toast(`Lỗi Tare: ${e.message}`, "error");
       }
+    });
+
+    document.getElementById("btn-reset-session")?.addEventListener("click", async () => {
+      try {
+        const res = await apiClient.resetStation({ reset_order: false });
+        this.lastInspectionCode = null;
+        if (res?.snapshot) {
+          this.update(res.snapshot, true);
+        }
+        this.toast("Đã reset phiên trạm cân về trạng thái sẵn sàng (IDLE).", "info");
+
+        const order = this.orders.find((o) => o.id === this.activeOrderId);
+        const promptBox = document.getElementById("wg-reset-order-prompt");
+        const promptMsg = document.getElementById("wg-reset-order-msg");
+        if (promptBox) {
+          if (order && order.progress?.completed > 0) {
+            if (promptMsg) {
+              promptMsg.textContent = `Phiếu "${order.title}" đang có ${order.progress.completed}/${order.progress.total} món tích xanh. Reset lại phiếu này để demo lặp lại?`;
+            }
+            promptBox.style.display = "block";
+          } else {
+            promptBox.style.display = "none";
+          }
+        }
+      } catch (e) {
+        this.toast(`Lỗi Reset phiên: ${e.message}`, "error");
+      }
+    });
+
+    document.getElementById("btn-reset-active-order")?.addEventListener("click", async () => {
+      const promptBox = document.getElementById("wg-reset-order-prompt");
+      if (promptBox) promptBox.style.display = "none";
+      if (!this.activeOrderId) return;
+      try {
+        const res = await apiClient.resetOrder(this.activeOrderId);
+        this.lastInspectionCode = null;
+        this.lastOrderStatus = "PENDING";
+        if (res?.order) this.onOrderEvent(res.order);
+        if (res?.snapshot) this.update(res.snapshot, true);
+        this.toast("Đã reset tích xanh của phiếu hiện tại về 0%.", "success");
+      } catch (e) {
+        this.toast(e.message, "error");
+      }
+    });
+
+    document.getElementById("btn-dismiss-reset-prompt")?.addEventListener("click", () => {
+      const promptBox = document.getElementById("wg-reset-order-prompt");
+      if (promptBox) promptBox.style.display = "none";
     });
 
     document.getElementById("btn-inspect-now")?.addEventListener("click", async () => {
@@ -377,12 +500,17 @@ export class LiveStationPage {
   update(snapshot, silent = false) {
     if (!snapshot) return;
     this.lastSnapshot = snapshot;
+    const weightG = Number(snapshot.weight_gram || 0);
+    if (snapshot.state === "IDLE" && (!snapshot.current_inspection || weightG < 8.0)) {
+      this.lastInspectionCode = null;
+    }
+
     updateWeightGauge(snapshot);
     updateLiveCameraCard(snapshot);
     updateNutritionTable(snapshot);
     this._renderOrderChecklist();
 
-    if (!silent && snapshot.current_inspection) {
+    if (!silent && snapshot.current_inspection && !(snapshot.state === "IDLE" && weightG < 8.0)) {
       this._notifyInspectionFeedback(snapshot.current_inspection);
     }
   }
@@ -404,7 +532,7 @@ export class LiveStationPage {
     this._renderOrderChecklist();
     if (order.status === "COMPLETED" && this.lastOrderStatus !== "COMPLETED") {
       this.lastOrderStatus = "COMPLETED";
-      this.toast("ĐÃ NHẬP ĐỦ NGUYÊN LIỆU CHO BẾP", "success");
+      this.toast("ĐÃ NHẬP ĐỦ 100% NGUYÊN LIỆU CHO BẾP", "success");
     } else {
       this.lastOrderStatus = order.status;
     }

@@ -85,18 +85,19 @@ export function updateLiveCameraCard(snapshot) {
 
   setText("det-weight-g", `${weightG.toFixed(1)} g`);
 
-  if (!insp) {
+  const isIdleEmpty = !insp || (snapshot.state === "IDLE" && weightG < 8.0);
+  if (isIdleEmpty) {
     if (aiBadge) {
       aiBadge.className = "badge badge-info";
-      aiBadge.textContent = snapshot.state === "STABILIZING" ? "Đang ổn định cân" : "Chờ thực phẩm";
+      aiBadge.textContent = snapshot.state === "STABILIZING" ? "Đang ổn định cân" : "Sẵn sàng";
     }
     if (fpsBadge) fpsBadge.textContent = "640x480 | Sẵn sàng";
     if (summaryEl) {
-      summaryEl.textContent = "Đặt thực phẩm lên đĩa cân (tối thiểu 15g) để hệ thống tự động nhận diện.";
+      summaryEl.textContent = "Sẵn sàng đặt thực phẩm mới (tối thiểu 15g) để hệ thống tự động nhận diện.";
     }
     setText("det-food-name", "Chờ nhận diện");
-    setText("det-food-en", "—");
-    setText("det-quality-text", "Trạng thái: Chờ cân");
+    setText("det-food-en", "Sẵn sàng đặt thực phẩm mới");
+    setText("det-quality-text", "Trạng thái: Chờ hàng");
     setText("det-total-price", "0 đ");
     setText("det-unit-price", "Đơn giá: 0 đ/kg");
     setText("det-confidence", "0.0%");

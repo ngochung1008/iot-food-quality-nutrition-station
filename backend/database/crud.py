@@ -716,8 +716,30 @@ def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
             (order_row["id"],),
         ).fetchall()
     ]
+    log_rows = conn.execute(
+        "SELECT id, weight_gram, energy_kcal, total_price_vnd FROM intake_logs WHERE order_id = ?",
+        (order_row["id"],),
+    ).fetchall()
+    log_map = {r["id"]: dict(r) for r in log_rows}
+
     total_items = len(items)
     completed_items = sum(1 for it in items if it["status"] == "COMPLETED")
+    actual_total_gram = 0.0
+    actual_total_cost_vnd = 0
+    actual_total_kcal = 0.0
+
+    for it in items:
+        if it["status"] != "COMPLETED":
+            continue
+        gram = float(it.get("actual_gram") or 0.0)
+        actual_total_gram += gram
+        log_doc = log_map.get(it.get("log_id") or "")
+        if log_doc:
+            actual_total_cost_vnd += int(log_doc.get("total_price_vnd") or 0)
+            actual_total_kcal += float(log_doc.get("energy_kcal") or 0.0)
+        else:
+            actual_total_cost_vnd += int(round((gram / 1000.0) * int(it.get("unit_price_per_kg") or 40000)))
+
     return {
         "id": order_row["id"],
         "order_code": order_row["order_code"],
@@ -741,6 +763,11 @@ def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
             "completed": completed_items,
             "total": total_items,
             "percent": round((completed_items / total_items) * 100.0, 1) if total_items else 0.0,
+        },
+        "actual_summary": {
+            "total_gram": round(actual_total_gram, 1),
+            "total_cost_vnd": int(actual_total_cost_vnd),
+            "total_kcal": round(actual_total_kcal, 1),
         },
         "items": items,
     }
@@ -859,6 +886,31 @@ def create_procurement_order(
         return _hydrate_order(conn, order_row)
 
 
+def reset_procurement_order(order_id: str) -> dict[str, Any] | None:
+    """Đặt lại toàn bộ trạng thái tích xanh của phiếu về PENDING để demo hoặc cân nhập lại."""
+    with get_db_conn() as conn:
+        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        if not order_row:
+            return None
+
+        conn.execute(
+            """
+            UPDATE procurement_items
+            SET actual_gram = 0.0, quality_status = '', confidence = 0.0,
+                status = 'PENDING', checked_by = '', checked_at = '',
+                log_id = '', image_url = ''
+            WHERE order_id = ?
+            """,
+            (order_id,),
+        )
+        conn.execute(
+            "UPDATE procurement_orders SET status = 'PENDING', completed_at = NULL WHERE id = ?",
+            (order_id,),
+        )
+        updated_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        return _hydrate_order(conn, updated_row)
+
+
 def list_procurement_orders(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     sql = "SELECT * FROM procurement_orders WHERE 1=1"
     params: list[Any] = []
@@ -931,6 +983,31 @@ def mark_procurement_item_completed(
 
         order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
         return _hydrate_order(conn, order_row)
+
+
+def reset_procurement_order(order_id: str) -> dict[str, Any] | None:
+    """Đặt lại toàn bộ trạng thái tích xanh của phiếu về PENDING để demo hoặc cân nhập lại."""
+    with get_db_conn() as conn:
+        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        if not order_row:
+            return None
+
+        conn.execute(
+            """
+            UPDATE procurement_items
+            SET actual_gram = 0.0, quality_status = '', confidence = 0.0,
+                status = 'PENDING', checked_by = '', checked_at = '',
+                log_id = '', image_url = ''
+            WHERE order_id = ?
+            """,
+            (order_id,),
+        )
+        conn.execute(
+            "UPDATE procurement_orders SET status = 'PENDING', completed_at = NULL WHERE id = ?",
+            (order_id,),
+        )
+        updated_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        return _hydrate_order(conn, updated_row)
 
 
 # ==============================================================================

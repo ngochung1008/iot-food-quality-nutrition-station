@@ -32,13 +32,30 @@ export function renderWeightGauge(container) {
             </div>
           </div>
 
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+          <div class="scale-actions-grid">
             <button id="btn-tare" class="btn btn-lg btn-outline" type="button">
               Tare / Về 0g
+            </button>
+            <button id="btn-reset-session" class="btn btn-lg btn-outline" type="button">
+              Reset phiên
             </button>
             <button id="btn-manual-confirm" class="btn btn-lg btn-green" type="button">
               Xác nhận thủ công
             </button>
+          </div>
+
+          <div id="wg-reset-order-prompt" style="display:none; background:var(--bg-muted); border:1px solid var(--border-strong); border-radius:8px; padding:12px 14px;">
+            <div id="wg-reset-order-msg" style="font-size:15px; font-weight:600; color:var(--text-primary); margin-bottom:10px;">
+              Phiếu hiện tại đã có nguyên liệu tích xanh. Reset lại tích xanh để demo lại?
+            </div>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+              <button id="btn-reset-active-order" class="btn btn-sm btn-primary" type="button">
+                Reset tích xanh phiếu này
+              </button>
+              <button id="btn-dismiss-reset-prompt" class="btn btn-sm btn-outline" type="button">
+                Giữ nguyên phiếu
+              </button>
+            </div>
           </div>
         </div>
 
@@ -119,7 +136,7 @@ export function updateWeightGauge(snapshot) {
   let completedUpTo = 0;
   let activeStep = 1;
 
-  if (st === "IDLE" && !insp) {
+  if (st === "IDLE" && (!insp || g < 8.0)) {
     completedUpTo = 0;
     activeStep = 1;
   } else if (st === "STABILIZING") {
@@ -140,12 +157,13 @@ export function updateWeightGauge(snapshot) {
   });
 
   if (confirmBtn) {
-    if (committed) {
+    const activeInsp = st === "IDLE" && g < 8.0 ? null : insp;
+    if (activeInsp && committed) {
       confirmBtn.textContent = "Đã lưu phiếu lô này";
       confirmBtn.disabled = true;
     } else {
       confirmBtn.textContent = "Xác nhận thủ công";
-      confirmBtn.disabled = g < 1.0 && !insp;
+      confirmBtn.disabled = g < 1.0 && !activeInsp;
     }
   }
 }

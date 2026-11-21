@@ -67,7 +67,9 @@ export function renderNutritionTable(container) {
 }
 
 export function updateNutritionTable(snapshot) {
-  const insp = snapshot?.current_inspection;
+  const rawInsp = snapshot?.current_inspection;
+  const weightG = Number(snapshot?.weight_gram || 0);
+  const insp = snapshot?.state === "IDLE" && weightG < 8.0 ? null : rawInsp;
   const banner = document.getElementById("nt-quality-banner");
   const qTitle = document.getElementById("nt-quality-title");
   const qDesc = document.getElementById("nt-quality-desc");

@@ -85,15 +85,18 @@ async def video_feed():
     """Luồng video MJPEG trực tiếp kèm overlay bounding box từ CameraManager."""
 
     async def frame_generator():
-        while True:
-            if station_service.camera:
-                chunk = station_service.camera.mjpeg_bytes()
-                if chunk:
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n" + chunk + b"\r\n"
-                    )
-            await asyncio.sleep(0.04)
+        try:
+            while True:
+                if station_service.camera:
+                    chunk = station_service.camera.mjpeg_bytes()
+                    if chunk:
+                        yield (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n\r\n" + chunk + b"\r\n"
+                        )
+                await asyncio.sleep(0.04)
+        except (asyncio.CancelledError, GeneratorExit):
+            return
 
     return StreamingResponse(
         frame_generator(),
@@ -115,7 +118,7 @@ async def websocket_station(websocket: WebSocket):
         while True:
             # Giữ kết nối mở và nhận lệnh ping/keepalive từ client nếu có
             await websocket.receive_text()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     except Exception as exc:
         logger.debug(f"[WS] Ngắt kết nối client: {exc}")
@@ -139,4 +142,5 @@ if __name__ == "__main__":
         port=settings.port,
         reload=False,
         log_level="info",
+        timeout_graceful_shutdown=2,
     )

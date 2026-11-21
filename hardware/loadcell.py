@@ -482,6 +482,13 @@ class LoadcellManager:
         out = float(statistics.median(self._rolling_grams))
         return 0.0 if out < self.zero_band_g else out
 
+    def reset_stability(self) -> None:
+        """Đặt lại mốc ổn định để cho phép chu trình cân mới bắt đầu lại sạch sẽ."""
+        with self._lock:
+            self.is_stable = False
+            self._stable_since = None
+            self._history.clear()
+
     def _update_stability(self, weight: float, now: float) -> None:
         """Kiểm tra cân ổn định khi Δm < STABILITY_DELTA_G trong STABILITY_HOLD_S giây."""
         self._history.append(weight)
