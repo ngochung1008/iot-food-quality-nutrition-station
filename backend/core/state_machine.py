@@ -195,6 +195,18 @@ class NutritionStationStateMachine:
                         cleared_to_idle = True
                 else:
                     self._below_idle_count = 0
+                    insp_w = float((self.current_inspection or {}).get("weight_gram") or 0.0)
+                    if self.current_inspection is not None and abs(w - insp_w) > 5.0:
+                        logger.info(
+                            f"[STATE] Phát hiện đổi hàng/trọng lượng lệch ±5g khi CHECKOUT ({insp_w:.1f}g -> {w:.1f}g) -> STABILIZING để quét lại"
+                        )
+                        self.current_inspection = None
+                        self._session_committed = False
+                        self.state = StationState.STABILIZING
+                        if hasattr(self.scale, "reset_stability"):
+                            self.scale.reset_stability()
+                        if self.camera:
+                            self.camera.set_overlay_detections([])
 
             self.scale.station_state = self.state.value
 
@@ -296,8 +308,10 @@ class NutritionStationStateMachine:
 
                 station_service._cleanup_old_captures(max_files=300)
 
-        detected_class = override_label or prediction.get("detected_class", "Unknown")
-        confidence = float(prediction.get("confidence", 0.0))
+        raw_ai_class = str(prediction.get("detected_class", "Unknown"))
+        raw_ai_conf = float(prediction.get("confidence", 0.0))
+        detected_class = override_label or raw_ai_class
+        confidence = raw_ai_conf
         if override_label:
             confidence = max(confidence, 0.99)
 
@@ -309,8 +323,8 @@ class NutritionStationStateMachine:
         if prediction.get("quality_note"):
             quality["badge_text"] = prediction["quality_note"]
             quality["recommendation"] = (
-                f"{prediction['quality_note']} ({confidence * 100:.0f}%). "
-                "Vui lòng kiểm tra cảm quan trước khi chốt nhập."
+                f"{prediction['quality_note']} - Khớp phiếu yêu cầu ({confidence * 100:.0f}%). "
+                "Vui lòng kiểm tra cảm quan và xác nhận thủ công trước khi chốt nhập."
             )
             quality["status"] = "WARNING"
             quality["alert_level"] = "warning"
@@ -329,6 +343,12 @@ class NutritionStationStateMachine:
         nutrition = calculate_nutrition(detected_class, w)
         batch_code = f"LOT-{time.strftime('%Y%m%d-%H%M%S')}"
         act = nutrition.get("actual", {})
+        manual_overridden = bool(override_label and override_label.strip().lower() != raw_ai_class.strip().lower())
+        override_note = (
+            f"Thủ công xác nhận (AI gốc: {raw_ai_class} {round(raw_ai_conf * 100):.0f}%)"
+            if manual_overridden
+            else ""
+        )
 
         inspection_result = {
             "batch_code": batch_code,
@@ -337,6 +357,10 @@ class NutritionStationStateMachine:
             "weight_gram": round(w, 1),
             "weight_g": round(w, 1),
             "detected_class": detected_class,
+            "ai_origin_class": raw_ai_class,
+            "ai_origin_confidence": round(raw_ai_conf, 3),
+            "manual_overridden": manual_overridden,
+            "override_note": override_note,
             "food_name_en": nutrition.get("class_name", detected_class),
             "food_name_vi": nutrition.get("vietnamese_name", detected_class),
             "confidence": round(confidence, 3),
@@ -384,10 +408,10 @@ class NutritionStationStateMachine:
             self._last_lcd_weight = w
             self._last_lcd_update_ts = time.time()
 
-        # Tự động đối chiếu & cộng dồn nhiều mẻ / TÍCH XANH vào Phiếu Yêu Cầu Nguyên Liệu (chỉ ghi 1 lần/phiên cho tới khi về IDLE)
+        # Chỉ tự động cộng dồn / TÍCH XANH khi chất lượng đạt FRESH (chặn auto-record khi WARNING hoặc REJECTED)
         auto_checked = False
         allow_auto_record = (not already_committed_in_session) or (override_label is not None and weight_gram is None)
-        if allow_auto_record and target_order_id and w >= settings.detect_weight_g and quality.get("status") != "REJECTED":
+        if allow_auto_record and target_order_id and w >= settings.detect_weight_g and quality.get("status") == "FRESH":
             from backend.database.crud import get_procurement_order
             from backend.services.station_service import station_service
 
@@ -422,7 +446,7 @@ class NutritionStationStateMachine:
                     except Exception as exc:
                         logger.warning(f"[STATE] Auto đối chiếu bỏ qua: {exc}")
 
-        if allow_auto_record and not auto_checked and self.auto_commit and w >= settings.idle_weight_g:
+        if allow_auto_record and not auto_checked and self.auto_commit and w >= settings.idle_weight_g and quality.get("status") == "FRESH":
             from backend.services.station_service import station_service
 
             station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định", accumulate=False)
@@ -433,17 +457,37 @@ class NutritionStationStateMachine:
         return inspection_result
 
     def override_current_food(self, class_name: str, weight_gram: float | None = None) -> dict[str, Any] | None:
-        """Cho phép đầu bếp chọn lại tên thực phẩm trước khi chốt đơn/lưu phiếu."""
+        """Cho phép đầu bếp chọn lại tên thực phẩm trước khi chốt đơn/lưu phiếu, lưu vết AI gốc."""
         with self._lock:
             w = float(weight_gram if weight_gram is not None else self.scale.current_weight)
             if self.current_inspection is None:
                 return self.run_inspection(weight_gram=w, override_label=class_name, override_quality="FRESH")
 
+            orig_cls = self.current_inspection.get("ai_origin_class") or self.current_inspection.get("detected_class", "Unknown")
+            orig_conf = float(self.current_inspection.get("ai_origin_confidence") or self.current_inspection.get("confidence", 0.0))
             nutrition = calculate_nutrition(class_name, w)
             quality = assess_food_quality(class_name, 1.0, [])
+            act = nutrition.get("actual", {})
+            self.current_inspection["ai_origin_class"] = orig_cls
+            self.current_inspection["ai_origin_confidence"] = round(orig_conf, 3)
+            self.current_inspection["manual_overridden"] = True
+            self.current_inspection["override_note"] = (
+                f"Thủ công xác nhận (AI gốc: {orig_cls} {round(orig_conf * 100):.0f}%)"
+            )
             self.current_inspection["detected_class"] = class_name
+            self.current_inspection["food_name_en"] = nutrition.get("class_name", class_name)
+            self.current_inspection["food_name_vi"] = nutrition.get("vietnamese_name", class_name)
             self.current_inspection["confidence"] = 1.0
+            self.current_inspection["confidence_percent"] = 100.0
             self.current_inspection["weight_gram"] = round(w, 1)
+            self.current_inspection["weight_g"] = round(w, 1)
+            self.current_inspection["unit_price_per_kg"] = int(nutrition.get("unit_price_per_kg", 0))
+            self.current_inspection["total_price_vnd"] = int(nutrition.get("total_price_vnd", 0))
+            self.current_inspection["calories"] = float(act.get("energy_kcal", 0.0))
+            self.current_inspection["protein"] = float(act.get("protein_g", 0.0))
+            self.current_inspection["lipid"] = float(act.get("fat_g", 0.0))
+            self.current_inspection["carb"] = float(act.get("carbohydrate_g", 0.0))
+            self.current_inspection["quality_status"] = quality.get("status", "FRESH")
             self.current_inspection["nutrition"] = nutrition
             self.current_inspection["quality"] = quality
             self.current_inspection["committed"] = False

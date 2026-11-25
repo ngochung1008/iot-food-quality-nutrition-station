@@ -134,6 +134,8 @@ export const apiClient = {
     request("/api/station/inspect", { method: "POST", body: JSON.stringify(payload) }),
   commitReceipt: (payload = {}) =>
     request("/api/station/commit", { method: "POST", body: JSON.stringify(payload) }),
+  rejectInspection: (payload) =>
+    request("/api/station/reject", { method: "POST", body: JSON.stringify(payload) }),
   overrideFood: (className) =>
     request("/api/station/override-food", {
       method: "POST",

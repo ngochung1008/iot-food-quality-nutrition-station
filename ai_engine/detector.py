@@ -832,7 +832,7 @@ def _pack_prediction(
             label = str(selected["label"])
             confidence = round(final_score, 3)
             quality_status = QualityStatus.WARNING.value
-            quality_note = "Độ tự tin trung bình - Khớp phiếu yêu cầu"
+            quality_note = "Cần kiểm tra cảm quan (Độ tự tin AI trung bình)"
             primary["label"] = label
             primary["confidence"] = confidence
             primary["raw_confidence"] = raw_conf

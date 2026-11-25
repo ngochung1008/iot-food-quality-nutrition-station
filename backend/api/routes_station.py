@@ -23,6 +23,12 @@ class CommitRequest(BaseModel):
     confirmed_by: str = "Nhân viên bếp"
 
 
+class RejectRequest(BaseModel):
+    reason: str = Field(..., min_length=2, max_length=200)
+    note: str = ""
+    confirmed_by: str = "Nhân viên bếp"
+
+
 class OverrideFoodRequest(BaseModel):
     class_name: str = Field(..., min_length=1)
 
@@ -112,6 +118,19 @@ def commit_receipt(body: CommitRequest | None = None):
         note=req.note,
         confirmed_by=req.confirmed_by,
     )
+
+
+@router.post("/reject")
+def reject_goods(body: RejectRequest):
+    """Từ chối lô hàng không đạt cảm quan, lưu bản ghi REJECTED (không cộng vào phiếu nhập kho)."""
+    try:
+        return station_service.reject_current_inspection(
+            reason=body.reason,
+            note=body.note,
+            confirmed_by=body.confirmed_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/override-food")

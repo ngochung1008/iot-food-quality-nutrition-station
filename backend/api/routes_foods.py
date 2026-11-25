@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.core.security import ROLE_ADMIN, ROLE_CHEF, require_roles, verify_admin_pin
 from backend.database.crud import list_foods, update_food_nutrition
@@ -15,16 +15,16 @@ router = APIRouter(prefix="/api/foods", tags=["Foods & Nutrition"])
 class FoodUpdateRequest(BaseModel):
     vietnamese_name: str | None = None
     food_group: str | None = None
-    edible_portion_percent: float | None = None
-    energy_kcal: float | None = None
-    protein_g: float | None = None
-    fat_g: float | None = None
-    carbohydrate_g: float | None = None
-    fiber_g: float | None = None
-    calcium_mg: float | None = None
-    iron_mg: float | None = None
-    vitamin_c_mg: float | None = None
-    unit_price_vnd_per_kg: int | None = None
+    edible_portion_percent: float | None = Field(default=None, gt=0.0, le=100.0)
+    energy_kcal: float | None = Field(default=None, ge=0.0)
+    protein_g: float | None = Field(default=None, ge=0.0)
+    fat_g: float | None = Field(default=None, ge=0.0)
+    carbohydrate_g: float | None = Field(default=None, ge=0.0)
+    fiber_g: float | None = Field(default=None, ge=0.0)
+    calcium_mg: float | None = Field(default=None, ge=0.0)
+    iron_mg: float | None = Field(default=None, ge=0.0)
+    vitamin_c_mg: float | None = Field(default=None, ge=0.0)
+    unit_price_vnd_per_kg: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
 
 

@@ -52,6 +52,30 @@ export function renderWeightGauge(container) {
             </button>
           </div>
 
+          <button id="btn-reject-goods" class="btn btn-pos btn-danger" style="width:100%;" type="button">
+            Từ chối hàng (Không đạt cảm quan)
+          </button>
+
+          <div id="wg-reject-panel" class="reject-panel" style="display:none;">
+            <div style="font-size:15px; font-weight:700; color:#7F1D1D; margin-bottom:8px;">
+              Chọn lý do từ chối nhập kho
+            </div>
+            <select id="reject-reason-select" class="select" style="width:100%; margin-bottom:8px;">
+              <option value="Hàng dập nát / ôi thiu">Hàng dập nát / ôi thiu</option>
+              <option value="Sai chủng loại / quy cách">Sai chủng loại / quy cách</option>
+              <option value="Không đạt vệ sinh">Không đạt vệ sinh</option>
+            </select>
+            <input id="reject-note-input" class="input" style="width:100%; margin-bottom:10px;" placeholder="Ghi chú thêm (tùy chọn)..." />
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button id="btn-confirm-reject" class="btn btn-sm btn-danger" type="button">
+                Ghi nhận từ chối (Không nhập kho)
+              </button>
+              <button id="btn-cancel-reject" class="btn btn-sm btn-outline" type="button">
+                Hủy
+              </button>
+            </div>
+          </div>
+
           <div id="wg-reset-order-prompt" style="display:none; background:var(--bg-muted); border:1px solid var(--border-strong); border-radius:8px; padding:12px 14px;">
             <div id="wg-reset-order-msg" style="font-size:15px; font-weight:600; color:var(--text-primary); margin-bottom:10px;">
               Phiếu hiện tại đã có nguyên liệu tích xanh. Reset lại tích xanh để demo lại?
@@ -105,6 +129,7 @@ export function updateWeightGauge(snapshot) {
   const onlineEl = document.getElementById("wg-online-badge");
   const calibEl = document.getElementById("wg-calib-badge");
   const confirmBtn = document.getElementById("btn-manual-confirm");
+  const rejectBtn = document.getElementById("btn-reject-goods");
   const stateBar = document.getElementById("wg-state-bar");
   const stateText = document.getElementById("wg-state-text");
 
@@ -198,5 +223,10 @@ export function updateWeightGauge(snapshot) {
       confirmBtn.textContent = "Chốt phiếu";
       confirmBtn.disabled = g < 1.0 && !activeInsp;
     }
+  }
+
+  if (rejectBtn) {
+    const activeInsp = st === "IDLE" && g < 8.0 ? null : insp;
+    rejectBtn.disabled = (g < 1.0 && !activeInsp) || Boolean(committed && qStatus === "REJECTED");
   }
 }

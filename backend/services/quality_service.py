@@ -30,12 +30,12 @@ def assess_food_quality(
             "alert_level": "danger",
         }
 
-    if not detected_class or detected_class == "Unknown" or confidence < 0.35:
+    if not detected_class or detected_class == "Unknown":
         return {
             "status": QualityStatus.WARNING.value,
             "is_acceptable": True,
-            "badge_text": "CẦN KIỂM TRA THỦ CÔNG",
-            "recommendation": "AI chưa nhận diện chắc chắn loại thực phẩm. Vui lòng chọn đúng tên thực phẩm trước khi lưu phiếu.",
+            "badge_text": "Cần kiểm tra cảm quan (Chưa nhận diện rõ)",
+            "recommendation": "AI chưa nhận diện chắc chắn loại thực phẩm. Vui lòng kiểm tra cảm quan và chọn đúng tên thực phẩm trước khi lưu phiếu.",
             "alert_level": "warning",
         }
 
@@ -43,15 +43,15 @@ def assess_food_quality(
         return {
             "status": QualityStatus.WARNING.value,
             "is_acceptable": True,
-            "badge_text": "ĐỘ TIN CẬY TRUNG BÌNH",
-            "recommendation": f"Độ tin cậy {confidence * 100:.0f}%. Kiểm tra nhanh cảm quan (màu sắc, mùi) trước khi nhập bếp.",
+            "badge_text": "Cần kiểm tra cảm quan (Độ tự tin AI trung bình)",
+            "recommendation": f"Độ tin cậy AI {confidence * 100:.0f}%. Cần kiểm tra cảm quan (màu sắc, mùi, độ tươi) và xác nhận thủ công trước khi nhập kho.",
             "alert_level": "warning",
         }
 
     return {
         "status": QualityStatus.FRESH.value,
         "is_acceptable": True,
-        "badge_text": "ĐẠT CHUẨN TƯƠI SẠCH",
-        "recommendation": "Thực phẩm đạt chất lượng đầu vào. Sẵn sàng chốt phiếu nhập kho bếp ăn.",
+        "badge_text": "Đạt chuẩn nhận diện (Chờ/Đạt QA cảm quan)",
+        "recommendation": f"Chủng loại '{detected_class}' khớp mẫu chuẩn (độ tin cậy {confidence * 100:.0f}%). Sẵn sàng tiếp nhận sau kiểm tra cảm quan.",
         "alert_level": "success",
     }

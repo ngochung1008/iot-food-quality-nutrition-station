@@ -74,10 +74,9 @@ def export_xlsx(
     date_to: str | None = Query(default=None),
     quality_status: str | None = Query(default=None),
 ):
-    """Xuất báo cáo Excel .xlsx gồm chi tiết lô cân và bảng tổng hợp dinh dưỡng."""
-    logs = list_intake_logs(limit=1000, date_from=date_from, date_to=date_to, quality_status=quality_status)
-    summary = get_summary_kpis(days=7)
-    payload = export_logs_to_xlsx(logs, summary=summary)
+    """Xuất báo cáo Excel .xlsx gồm chi tiết lô cân và bảng tổng hợp đúng khoảng lọc."""
+    logs = list_intake_logs(limit=5000, date_from=date_from, date_to=date_to, quality_status=quality_status)
+    payload = export_logs_to_xlsx(logs, summary=None)
     return Response(
         content=payload,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

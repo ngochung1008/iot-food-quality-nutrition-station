@@ -161,9 +161,9 @@ def check_and_complete_order_item(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/orders/{order_id}/reset", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF, ROLE_RECEIVER))])
+@router.post("/orders/{order_id}/reset", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF))])
 def reset_order_checklist(order_id: str):
-    """Đặt lại toàn bộ tích xanh của phiếu về PENDING để demo lặp lại."""
+    """Đặt lại toàn bộ tích xanh của phiếu về PENDING để demo lặp lại (Chỉ ADMIN/CHEF)."""
     updated = reset_procurement_order(order_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Không tìm thấy phiếu yêu cầu.")
@@ -172,13 +172,13 @@ def reset_order_checklist(order_id: str):
     return {"ok": True, "order": updated, "snapshot": snap}
 
 
-@router.post("/orders/{order_id}/add-extra-item", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF, ROLE_RECEIVER))])
+@router.post("/orders/{order_id}/add-extra-item", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF))])
 def add_extra_order_item(
     order_id: str,
     body: AddExtraOrderItemRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Bổ sung nguyên liệu phát sinh ngoài phiếu (và tích xanh) hoặc thêm nguyên liệu thủ công vào phiếu."""
+    """Bổ sung nguyên liệu phát sinh ngoài phiếu hoặc thêm nguyên liệu thủ công vào phiếu (Chỉ ADMIN/CHEF)."""
     try:
         return station_service.add_extra_item_to_order(
             order_id=order_id,

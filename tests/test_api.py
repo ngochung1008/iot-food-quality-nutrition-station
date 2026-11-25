@@ -612,7 +612,18 @@ def _run_e2e_test_body():
         assert rs_json["order"]["status"] == "PENDING"
         assert rs_json["order"]["progress"]["completed"] == 0
 
-        r_reset_order = client.post(f"/api/kitchen/orders/{order_id}/reset", headers=recv_hdr)
+        # RECEIVER không được phép tự ý reset phiếu hoặc bổ sung nguyên liệu phát sinh (403)
+        assert client.post(f"/api/kitchen/orders/{order_id}/reset", headers=recv_hdr).status_code == 403
+        assert (
+            client.post(
+                f"/api/kitchen/orders/{order_id}/add-extra-item",
+                headers=recv_hdr,
+                json={"class_name": "Banana", "mark_completed": True},
+            ).status_code
+            == 403
+        )
+
+        r_reset_order = client.post(f"/api/kitchen/orders/{order_id}/reset", headers=chef_hdr)
         assert r_reset_order.status_code == 200
         assert r_reset_order.json()["order"]["progress"]["completed"] == 0
 
@@ -622,7 +633,7 @@ def _run_e2e_test_body():
         client.post("/api/station/inspect", json={"override_label": "Banana", "override_quality": "FRESH"})
         r_extra_done = client.post(
             f"/api/kitchen/orders/{order_id}/add-extra-item",
-            headers=recv_hdr,
+            headers=chef_hdr,
             json={"class_name": "Banana", "mark_completed": True, "note": "Bổ sung phát sinh tại trạm"},
         )
         assert r_extra_done.status_code == 200, r_extra_done.text
@@ -636,7 +647,7 @@ def _run_e2e_test_body():
         # Kiểm tra nút "+ Thêm món vào phiếu" (PENDING) từ 64 nguyên liệu chuẩn
         r_add_pending = client.post(
             f"/api/kitchen/orders/{order_id}/add-extra-item",
-            headers=recv_hdr,
+            headers=chef_hdr,
             json={"class_name": "Carrot", "required_gram": 500.0, "mark_completed": False},
         )
         assert r_add_pending.status_code == 200, r_add_pending.text
@@ -1047,7 +1058,7 @@ def test_order_reset_does_not_accumulate_stale_logs_cost_or_kcal():
         log1_id = ord1["items"][0]["log_id"]
 
         # Reset phiếu -> log1 phải bị gỡ order_id/order_item_id và summary về 0
-        r_rst = client.post(f"/api/kitchen/orders/{order_id}/reset", headers=recv_hdr)
+        r_rst = client.post(f"/api/kitchen/orders/{order_id}/reset", headers=chef_hdr)
         assert r_rst.status_code == 200
         rst_ord = r_rst.json()["order"]
         assert rst_ord["actual_summary"]["total_gram"] == 0.0
@@ -1147,3 +1158,189 @@ def test_delete_procurement_order_and_dish():
 
         # Dọn dẹp log test
         client.delete(f"/api/logs/{log_id}", headers=admin_hdr)
+
+
+def test_commercial_quality_guards_and_excel_export():
+    """Kiểm tra: chặn auto-commit khi WARNING, re-inspect khi đổi hàng >5g lúc CHECKOUT, phục hồi HX711, reject API, validation & Excel."""
+    import threading
+    import time as _t
+    import zipfile
+    import io
+    from backend.core.constants import StationState
+    from backend.core.state_machine import NutritionStationStateMachine
+    from backend.services.export_service import export_logs_to_xlsx
+    import hardware.loadcell as lc_mod
+
+    # 1. Tự động chuyển về STABILIZING nếu trọng lượng thay đổi > ±5g khi đang CHECKOUT
+    class _SwapScale:
+        current_weight = 52.0
+        is_stable = False
+        scale_online = True
+        calibrated = True
+        station_state = "IDLE"
+        reset_called = False
+
+        def read_filtered_weight(self):
+            return self.current_weight
+
+        def reset_stability(self):
+            self.reset_called = True
+            self.is_stable = False
+
+    class _DummyCam:
+        overlay_calls = []
+
+        def get_frame(self):
+            return None
+
+        def set_overlay_detections(self, dets):
+            self.overlay_calls.append(list(dets))
+
+    class _DummyDet:
+        def predict(self, frame, w=0.0, expected_classes=None):
+            return {"detected_class": "Egg", "confidence": 0.95, "detections": []}
+
+    sw_scale = _SwapScale()
+    sw_cam = _DummyCam()
+    sm = NutritionStationStateMachine(scale=sw_scale, camera=sw_cam, detector=_DummyDet(), lcd=None)
+    assert sm.update() == StationState.STABILIZING.value
+    sw_scale.is_stable = True
+    assert sm.update() == StationState.CHECKOUT.value
+    assert sm.current_inspection is not None
+
+    # Giữ >= 8g nhưng đổi vật khác nặng 120g (chênh > 5g) -> buộc quay lại STABILIZING & xóa kết quả AI cũ
+    sw_scale.current_weight = 120.0
+    assert sm.update() == StationState.STABILIZING.value
+    assert sm.current_inspection is None
+    assert sw_scale.reset_called is True
+
+    # 2. Phục hồi self.last_error = None và self.is_online = True trong HX711 _reader_loop()
+    mgr_rec = object.__new__(lc_mod.LoadcellManager)
+    mgr_rec.mock_mode = False
+    mgr_rec.hardware_available = True
+    mgr_rec.dt_pin = 5
+    mgr_rec.sck_pin = 6
+    mgr_rec.invert_signal = True
+    mgr_rec.scale_ratio = -392.25
+    mgr_rec.offset = 10000.0
+    mgr_rec.calibrated = True
+    mgr_rec.zero_band_g = 0.5
+    mgr_rec.station_state = "IDLE"
+    mgr_rec.auto_zero_min_g = 0.1
+    mgr_rec.auto_zero_max_g = 0.8
+    mgr_rec.auto_zero_hold_s = 4.0
+    mgr_rec.last_grams = 0.0
+    mgr_rec.current_weight = 0.0
+    mgr_rec.is_stable = False
+    mgr_rec.scale_online = False
+    mgr_rec.is_online = False
+    mgr_rec.last_error = "Lỗi đọc HX711 cũ"
+    mgr_rec.last_sample_time = 0.0
+    mgr_rec.last_raw_timestamp = 0.0
+    mgr_rec._lock = threading.Lock()
+    mgr_rec._raw_cond = threading.Condition(mgr_rec._lock)
+    mgr_rec._raw_buffer = lc_mod.deque(maxlen=30)
+    mgr_rec._raw_seq = 0
+    mgr_rec._history = lc_mod.deque(maxlen=20)
+    mgr_rec._rolling_grams = lc_mod.deque(maxlen=3)
+    mgr_rec._spike_skip_count = 0
+    mgr_rec._bitshift_skip_count = 0
+    mgr_rec._step_jump_count = 0
+    mgr_rec._stable_since = None
+    mgr_rec._drift_since = None
+    mgr_rec._drift_raw_samples = lc_mod.deque(maxlen=40)
+    mgr_rec._stop_event = threading.Event()
+
+    def _mock_raw_once():
+        mgr_rec._stop_event.set()
+        return 10000.0 + 50.0 * (-392.25)
+
+    mgr_rec._read_raw_once_for_loop = _mock_raw_once
+    orig_has_gpio = lc_mod.HAS_RPI_GPIO
+    try:
+        lc_mod.HAS_RPI_GPIO = True
+        mgr_rec._reader_loop()
+    finally:
+        lc_mod.HAS_RPI_GPIO = orig_has_gpio
+
+    assert mgr_rec.last_error is None
+    assert mgr_rec.is_online is True
+    assert mgr_rec.scale_online is True
+    assert mgr_rec.get_status()["status"] == "PASS"
+
+    # 3. API E2E: chặn auto-commit khi WARNING, lưu vết override_food, reject API, food validation & Excel export
+    with TestClient(app) as client:
+        admin_hdr = _login(client, "admin", "admin123")
+        chef_hdr = _login(client, "chef", "chef123")
+        recv_hdr = _login(client, "receiver", "receiver123")
+
+        dishes = client.get("/api/kitchen/dishes", headers=chef_hdr).json()
+        fish_dish = next(d for d in dishes if any(i["class_name"] == "Fish" for i in d["ingredients"]))
+        r_ord = client.post(
+            "/api/kitchen/orders",
+            headers=chef_hdr,
+            json={
+                "title": "Phiếu test WARNING & Reject",
+                "meal_date": "2026-11-25",
+                "meal_shift": "Bữa trưa",
+                "servings": 1,
+                "dish_ids": [fish_dish["id"]],
+                "tolerance_percent": 5.0,
+            },
+        )
+        assert r_ord.status_code == 200
+        order = r_ord.json()
+        order_id = order["id"]
+        fish_item = next(i for i in order["items"] if i["class_name"] == "Fish")
+
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/active-order", json={"order_id": order_id})
+        client.post("/api/station/simulate/weight", json={"weight_gram": float(fish_item["required_gram"])})
+
+        # 3a. Khi WARNING -> KHÔNG được tự động tích xanh (item vẫn PENDING)
+        r_warn = client.post("/api/station/inspect", json={"override_label": "Fish", "override_quality": "WARNING"})
+        assert r_warn.status_code == 200
+        assert r_warn.json()["inspection"]["quality_status"] == "WARNING"
+        ord_warn = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        fish_warn = next(i for i in ord_warn["items"] if i["id"] == fish_item["id"])
+        assert fish_warn["status"] == "PENDING"
+
+        # 3b. Override nhãn thủ công & chốt -> note phải lưu vết AI gốc
+        client.post("/api/station/override-food", json={"class_name": "Tomato"})
+        r_ovr_commit = client.post("/api/station/commit", json={"confirmed_by": "Nhân viên test"})
+        assert r_ovr_commit.status_code == 200
+        ovr_rec = r_ovr_commit.json()["receipt"]
+        assert "Thủ công xác nhận (AI gốc:" in ovr_rec["note"]
+
+        # 3c. Reject API -> lưu bản ghi REJECTED kèm lý do, không cộng vào phiếu
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/simulate/weight", json={"weight_gram": 250.0})
+        client.post("/api/station/inspect", json={"override_label": "Tomato", "override_quality": "WARNING"})
+        r_rej = client.post(
+            "/api/station/reject",
+            json={"reason": "Hàng dập nát / ôi thiu", "confirmed_by": "Nguyễn Chánh Khiêm"},
+        )
+        assert r_rej.status_code == 200, r_rej.text
+        rej_rec = r_rej.json()["receipt"]
+        assert rej_rec["quality_status"] == "REJECTED"
+        assert "Từ chối nhập kho - Lý do: Hàng dập nát / ôi thiu" in rej_rec["note"]
+
+        # 3d. Food update validation chặn số âm & edible_portion_percent = 0
+        foods = client.get("/api/foods").json()
+        fid = foods[0]["id"]
+        assert client.put(f"/api/foods/{fid}", headers=admin_hdr, json={"unit_price_vnd_per_kg": -100}).status_code == 422
+        assert client.put(f"/api/foods/{fid}", headers=admin_hdr, json={"edible_portion_percent": 0}).status_code == 422
+
+        # 3e. Xuất Excel .xlsx chứa đầy đủ cột mới & lọc đúng ngày
+        xlsx_bytes = export_logs_to_xlsx([ovr_rec, rej_rec])
+        with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zf:
+            shared_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+            for col in ("Mã phiếu", "Đơn giá (đ/kg)", "Thành tiền (đ)", "Người xác nhận"):
+                assert col in shared_xml, f"Thiếu cột Excel: {col}"
+        r_xlsx = client.get("/api/reports/export.xlsx?date_from=2026-11-25&date_to=2026-11-25")
+        assert r_xlsx.status_code == 200
+
+        # Dọn dẹp
+        client.delete(f"/api/kitchen/orders/{order_id}", headers=chef_hdr)
+        client.delete(f"/api/logs/{ovr_rec['id']}", headers=admin_hdr)
+        client.delete(f"/api/logs/{rej_rec['id']}", headers=admin_hdr)

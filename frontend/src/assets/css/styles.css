@@ -1006,6 +1006,63 @@ tr.row-matched td {
   max-width: 420px;
 }
 
+.reject-panel {
+  background: #FEF2F2;
+  border: 1px solid #FCA5A5;
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+}
+
+@media (max-width: 1024px) {
+  .topbar {
+    padding: 8px 14px;
+    gap: 10px;
+  }
+  .container {
+    padding: 12px;
+  }
+  .station-pos-grid,
+  .col-stack {
+    gap: 14px;
+  }
+  .card {
+    padding: 14px;
+  }
+  .card-head {
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    gap: 8px;
+  }
+  .card-title {
+    font-size: 17px;
+  }
+  .weight-panel {
+    padding: 12px;
+  }
+  .weight-hero {
+    font-size: 46px;
+  }
+  .scale-stepper-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .btn,
+  .btn-sm,
+  .nav-tab,
+  .input,
+  .select {
+    min-height: 44px;
+  }
+  .btn-pos {
+    min-height: 48px;
+    padding: 10px 12px;
+    font-size: 15px;
+  }
+  .v-step {
+    padding: 9px 12px;
+  }
+}
+
 .toast {
   background: #0F172A;
   color: #FFFFFF;

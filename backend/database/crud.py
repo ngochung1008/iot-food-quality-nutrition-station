@@ -800,10 +800,13 @@ def create_procurement_order(
         raise ValueError("Vui lòng chọn ít nhất 1 món ăn cho thực đơn.")
 
     order_id = f"ord_{uuid.uuid4().hex[:10]}"
-    order_code = f"PO-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    base_code = f"PO-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     now = utc_now_iso()
 
     with get_db_conn() as conn:
+        order_code = base_code
+        if conn.execute("SELECT 1 FROM procurement_orders WHERE order_code = ?", (order_code,)).fetchone():
+            order_code = f"{base_code}-{uuid.uuid4().hex[:4].upper()}"
         aggregated_ingredients: dict[str, dict[str, Any]] = {}
         selected_dishes: list[dict[str, Any]] = []
         total_kcal = 0.0
@@ -914,6 +917,76 @@ def get_procurement_order(order_id: str) -> dict[str, Any] | None:
         return _hydrate_order(conn, row) if row else None
 
 
+def _mark_procurement_item_completed_on_conn(
+    conn: Any,
+    order_id: str,
+    item_id: str,
+    actual_gram: float,
+    quality_status: str,
+    confidence: float,
+    checked_by: str,
+    log_id: str,
+    image_url: str | None = None,
+    accumulate: bool = False,
+    allow_partial: bool = False,
+) -> dict[str, Any]:
+    now = utc_now_iso()
+    item_row = conn.execute(
+        "SELECT * FROM procurement_items WHERE id = ? AND order_id = ?",
+        (item_id, order_id),
+    ).fetchone()
+    if not item_row:
+        raise ValueError("Không tìm thấy dòng nguyên liệu trong phiếu yêu cầu.")
+
+    grams_rounded = round(float(actual_gram), 1)
+    cur_status = str(item_row["status"] or "PENDING").upper()
+    if cur_status == "PARTIAL" or (accumulate and cur_status == "COMPLETED"):
+        new_actual_gram = round(float(item_row["actual_gram"] or 0.0) + grams_rounded, 1)
+    else:
+        # Nếu nguyên liệu đang PENDING (chưa có mẻ thực tế nào), lấy đúng trọng lượng hiện tại, không cộng dồn nhầm
+        new_actual_gram = grams_rounded
+
+    min_acc = float(item_row["min_acceptable_gram"] or 0.0)
+    if allow_partial and new_actual_gram < min_acc:
+        new_status = "PARTIAL"
+    else:
+        new_status = "COMPLETED"
+
+    conn.execute(
+        """
+        UPDATE procurement_items
+        SET actual_gram = ?, quality_status = ?, confidence = ?,
+            status = ?, checked_by = ?, checked_at = ?,
+            log_id = ?, image_url = ?
+        WHERE id = ?
+        """,
+        (
+            new_actual_gram, quality_status, round(confidence, 3),
+            new_status, checked_by, now, log_id, image_url or "", item_id,
+        ),
+    )
+
+    # Kiểm tra nếu tất cả nguyên liệu trong phiếu đã COMPLETED -> chuyển đơn sang COMPLETED
+    pending = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM procurement_items WHERE order_id = ? AND status != 'COMPLETED'",
+        (order_id,),
+    ).fetchone()["cnt"]
+
+    if pending == 0:
+        conn.execute(
+            "UPDATE procurement_orders SET status = 'COMPLETED', completed_at = ? WHERE id = ?",
+            (now, order_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE procurement_orders SET status = 'IN_PROGRESS', completed_at = NULL WHERE id = ? AND status IN ('PENDING', 'IN_PROGRESS', 'COMPLETED')",
+            (order_id,),
+        )
+
+    order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+    return _hydrate_order(conn, order_row)
+
+
 def mark_procurement_item_completed(
     order_id: str,
     item_id: str,
@@ -927,62 +1000,20 @@ def mark_procurement_item_completed(
     allow_partial: bool = False,
 ) -> dict[str, Any]:
     """Đánh dấu tiến độ nguyên liệu trong phiếu: cộng dồn khi PARTIAL (hoặc COMPLETED + accumulate=True), tự chuyển COMPLETED khi đạt >= min_acceptable_gram."""
-    now = utc_now_iso()
     with get_db_conn() as conn:
-        item_row = conn.execute(
-            "SELECT * FROM procurement_items WHERE id = ? AND order_id = ?",
-            (item_id, order_id),
-        ).fetchone()
-        if not item_row:
-            raise ValueError("Không tìm thấy dòng nguyên liệu trong phiếu yêu cầu.")
-
-        grams_rounded = round(float(actual_gram), 1)
-        cur_status = str(item_row["status"] or "PENDING").upper()
-        if cur_status == "PARTIAL" or (accumulate and cur_status == "COMPLETED"):
-            new_actual_gram = round(float(item_row["actual_gram"] or 0.0) + grams_rounded, 1)
-        else:
-            # Nếu nguyên liệu đang PENDING (chưa có mẻ thực tế nào), lấy đúng trọng lượng hiện tại, không cộng dồn nhầm
-            new_actual_gram = grams_rounded
-
-        min_acc = float(item_row["min_acceptable_gram"] or 0.0)
-        if allow_partial and new_actual_gram < min_acc:
-            new_status = "PARTIAL"
-        else:
-            new_status = "COMPLETED"
-
-        conn.execute(
-            """
-            UPDATE procurement_items
-            SET actual_gram = ?, quality_status = ?, confidence = ?,
-                status = ?, checked_by = ?, checked_at = ?,
-                log_id = ?, image_url = ?
-            WHERE id = ?
-            """,
-            (
-                new_actual_gram, quality_status, round(confidence, 3),
-                new_status, checked_by, now, log_id, image_url or "", item_id,
-            ),
+        return _mark_procurement_item_completed_on_conn(
+            conn=conn,
+            order_id=order_id,
+            item_id=item_id,
+            actual_gram=actual_gram,
+            quality_status=quality_status,
+            confidence=confidence,
+            checked_by=checked_by,
+            log_id=log_id,
+            image_url=image_url,
+            accumulate=accumulate,
+            allow_partial=allow_partial,
         )
-
-        # Kiểm tra nếu tất cả nguyên liệu trong phiếu đã COMPLETED -> chuyển đơn sang COMPLETED
-        pending = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM procurement_items WHERE order_id = ? AND status != 'COMPLETED'",
-            (order_id,),
-        ).fetchone()["cnt"]
-
-        if pending == 0:
-            conn.execute(
-                "UPDATE procurement_orders SET status = 'COMPLETED', completed_at = ? WHERE id = ?",
-                (now, order_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE procurement_orders SET status = 'IN_PROGRESS', completed_at = NULL WHERE id = ? AND status IN ('PENDING', 'IN_PROGRESS', 'COMPLETED')",
-                (order_id,),
-            )
-
-        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
-        return _hydrate_order(conn, order_row)
 
 
 def reset_procurement_order(order_id: str) -> dict[str, Any] | None:
@@ -1176,89 +1207,125 @@ def add_procurement_order_item(
 # INTAKE LOGS & DAILY ANALYTICS
 # ==============================================================================
 
-def insert_intake_log(doc: dict[str, Any]) -> dict[str, Any]:
+def _insert_intake_log_on_conn(conn: Any, doc: dict[str, Any]) -> dict[str, Any]:
     local_date = doc.get("local_date") or local_today_str()
-    with get_db_conn() as conn:
+    conn.execute(
+        """
+        INSERT INTO intake_logs (
+            id, batch_code, timestamp, local_date, station_id,
+            class_name, food_name_vi, food_group,
+            weight_gram, edible_gram, quality_status, confidence,
+            inference_time_ms, strategy,
+            energy_kcal, protein_g, fat_g, carbohydrate_g, fiber_g,
+            calcium_mg, iron_mg, vitamin_c_mg,
+            image_url, note, confirmed_by, order_id, order_item_id,
+            unit_price_per_kg, total_price_vnd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            doc["id"], doc["batch_code"], doc["timestamp"], local_date, doc["station_id"],
+            doc["class_name"], doc["food_name_vi"], doc["food_group"],
+            doc["weight_gram"], doc["edible_gram"], doc["quality_status"], doc["confidence"],
+            doc["inference_time_ms"], doc["strategy"],
+            doc["energy_kcal"], doc["protein_g"], doc["fat_g"], doc["carbohydrate_g"], doc["fiber_g"],
+            doc["calcium_mg"], doc["iron_mg"], doc["vitamin_c_mg"],
+            doc.get("image_url"), doc.get("note", ""), doc.get("confirmed_by", "Trạm cân AI"),
+            doc.get("order_id", ""), doc.get("order_item_id", ""),
+            int(doc.get("unit_price_per_kg", 0)), int(doc.get("total_price_vnd", 0)),
+        ),
+    )
+
+    is_accepted = doc["quality_status"] != "REJECTED"
+    row = conn.execute("SELECT * FROM daily_nutrition_analytics WHERE date = ?", (local_date,)).fetchone()
+
+    w_kg = round(doc["weight_gram"] / 1000.0, 4)
+    acc_kg = w_kg if is_accepted else 0.0
+    add_kcal = doc["energy_kcal"] if is_accepted else 0.0
+    add_p = doc["protein_g"] if is_accepted else 0.0
+    add_f = doc["fat_g"] if is_accepted else 0.0
+    add_c = doc["carbohydrate_g"] if is_accepted else 0.0
+    add_fib = doc["fiber_g"] if is_accepted else 0.0
+
+    fresh_inc = 1 if doc["quality_status"] == "FRESH" else 0
+    warn_inc = 1 if doc["quality_status"] == "WARNING" else 0
+    rej_inc = 1 if doc["quality_status"] == "REJECTED" else 0
+
+    if row is None:
         conn.execute(
             """
-            INSERT INTO intake_logs (
-                id, batch_code, timestamp, local_date, station_id,
-                class_name, food_name_vi, food_group,
-                weight_gram, edible_gram, quality_status, confidence,
-                inference_time_ms, strategy,
-                energy_kcal, protein_g, fat_g, carbohydrate_g, fiber_g,
-                calcium_mg, iron_mg, vitamin_c_mg,
-                image_url, note, confirmed_by, order_id, order_item_id,
-                unit_price_per_kg, total_price_vnd
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_nutrition_analytics (
+                date, total_batches, fresh_count, warning_count, rejected_count,
+                total_weight_kg, accepted_weight_kg, total_kcal,
+                total_protein_g, total_fat_g, total_carb_g, total_fiber_g
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                doc["id"], doc["batch_code"], doc["timestamp"], local_date, doc["station_id"],
-                doc["class_name"], doc["food_name_vi"], doc["food_group"],
-                doc["weight_gram"], doc["edible_gram"], doc["quality_status"], doc["confidence"],
-                doc["inference_time_ms"], doc["strategy"],
-                doc["energy_kcal"], doc["protein_g"], doc["fat_g"], doc["carbohydrate_g"], doc["fiber_g"],
-                doc["calcium_mg"], doc["iron_mg"], doc["vitamin_c_mg"],
-                doc.get("image_url"), doc.get("note", ""), doc.get("confirmed_by", "Trạm cân AI"),
-                doc.get("order_id", ""), doc.get("order_item_id", ""),
-                int(doc.get("unit_price_per_kg", 0)), int(doc.get("total_price_vnd", 0)),
+                local_date, fresh_inc, warn_inc, rej_inc,
+                w_kg, acc_kg, round(add_kcal, 1),
+                round(add_p, 1), round(add_f, 1), round(add_c, 1), round(add_fib, 1),
             ),
         )
-
-        is_accepted = doc["quality_status"] != "REJECTED"
-        row = conn.execute("SELECT * FROM daily_nutrition_analytics WHERE date = ?", (local_date,)).fetchone()
-
-        w_kg = round(doc["weight_gram"] / 1000.0, 4)
-        acc_kg = w_kg if is_accepted else 0.0
-        add_kcal = doc["energy_kcal"] if is_accepted else 0.0
-        add_p = doc["protein_g"] if is_accepted else 0.0
-        add_f = doc["fat_g"] if is_accepted else 0.0
-        add_c = doc["carbohydrate_g"] if is_accepted else 0.0
-        add_fib = doc["fiber_g"] if is_accepted else 0.0
-
-        fresh_inc = 1 if doc["quality_status"] == "FRESH" else 0
-        warn_inc = 1 if doc["quality_status"] == "WARNING" else 0
-        rej_inc = 1 if doc["quality_status"] == "REJECTED" else 0
-
-        if row is None:
-            conn.execute(
-                """
-                INSERT INTO daily_nutrition_analytics (
-                    date, total_batches, fresh_count, warning_count, rejected_count,
-                    total_weight_kg, accepted_weight_kg, total_kcal,
-                    total_protein_g, total_fat_g, total_carb_g, total_fiber_g
-                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    local_date, fresh_inc, warn_inc, rej_inc,
-                    w_kg, acc_kg, round(add_kcal, 1),
-                    round(add_p, 1), round(add_f, 1), round(add_c, 1), round(add_fib, 1),
-                ),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE daily_nutrition_analytics
-                SET total_batches = total_batches + 1,
-                    fresh_count = fresh_count + ?,
-                    warning_count = warning_count + ?,
-                    rejected_count = rejected_count + ?,
-                    total_weight_kg = ROUND(total_weight_kg + ?, 3),
-                    accepted_weight_kg = ROUND(accepted_weight_kg + ?, 3),
-                    total_kcal = ROUND(total_kcal + ?, 1),
-                    total_protein_g = ROUND(total_protein_g + ?, 1),
-                    total_fat_g = ROUND(total_fat_g + ?, 1),
-                    total_carb_g = ROUND(total_carb_g + ?, 1),
-                    total_fiber_g = ROUND(total_fiber_g + ?, 1)
-                WHERE date = ?
-                """,
-                (
-                    fresh_inc, warn_inc, rej_inc,
-                    w_kg, acc_kg, add_kcal, add_p, add_f, add_c, add_fib,
-                    local_date,
-                ),
-            )
+    else:
+        conn.execute(
+            """
+            UPDATE daily_nutrition_analytics
+            SET total_batches = total_batches + 1,
+                fresh_count = fresh_count + ?,
+                warning_count = warning_count + ?,
+                rejected_count = rejected_count + ?,
+                total_weight_kg = ROUND(total_weight_kg + ?, 3),
+                accepted_weight_kg = ROUND(accepted_weight_kg + ?, 3),
+                total_kcal = ROUND(total_kcal + ?, 1),
+                total_protein_g = ROUND(total_protein_g + ?, 1),
+                total_fat_g = ROUND(total_fat_g + ?, 1),
+                total_carb_g = ROUND(total_carb_g + ?, 1),
+                total_fiber_g = ROUND(total_fiber_g + ?, 1)
+            WHERE date = ?
+            """,
+            (
+                fresh_inc, warn_inc, rej_inc,
+                w_kg, acc_kg, add_kcal, add_p, add_f, add_c, add_fib,
+                local_date,
+            ),
+        )
     return doc
+
+
+def insert_intake_log(doc: dict[str, Any]) -> dict[str, Any]:
+    with get_db_conn() as conn:
+        return _insert_intake_log_on_conn(conn, doc)
+
+
+def commit_intake_and_order_item_tx(
+    receipt: dict[str, Any],
+    order_id: str | None = None,
+    order_item_id: str | None = None,
+    actual_gram: float = 0.0,
+    quality_status: str = "FRESH",
+    confidence: float = 0.0,
+    checked_by: str = "",
+    image_url: str | None = None,
+    accumulate: bool = False,
+    allow_partial: bool = False,
+) -> dict[str, Any] | None:
+    """Thực hiện đồng bộ ghi intake_logs + daily_nutrition_analytics + procurement_items trong 1 SQLite transaction."""
+    with get_db_conn() as conn:
+        _insert_intake_log_on_conn(conn, receipt)
+        if order_id and order_item_id:
+            return _mark_procurement_item_completed_on_conn(
+                conn=conn,
+                order_id=order_id,
+                item_id=order_item_id,
+                actual_gram=actual_gram,
+                quality_status=quality_status,
+                confidence=confidence,
+                checked_by=checked_by,
+                log_id=receipt["id"],
+                image_url=image_url,
+                accumulate=accumulate,
+                allow_partial=allow_partial,
+            )
+        return None
 
 
 def list_intake_logs(

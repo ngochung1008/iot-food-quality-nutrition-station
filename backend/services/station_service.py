@@ -14,11 +14,11 @@ from backend.core.config import settings
 from backend.core.state_machine import NutritionStationStateMachine
 from backend.database.crud import (
     add_procurement_order_item,
+    commit_intake_and_order_item_tx,
     get_procurement_order,
     init_database,
     insert_intake_log,
     local_today_str,
-    mark_procurement_item_completed,
     utc_now_iso,
 )
 from hardware.camera import CameraManager
@@ -102,6 +102,7 @@ class StationService:
         self._started = False
         self._stop_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
+        self._commit_lock = threading.RLock()
         self.ws_hub = WebSocketHub()
 
         self.scale: LoadcellManager | None = None
@@ -264,115 +265,203 @@ class StationService:
         accumulate: bool = False,
         allow_partial: bool = False,
     ) -> dict[str, Any]:
-        """Chốt đơn / Lưu phiếu tiếp nhận vào SQLite (hỗ trợ đối chiếu Phiếu Yêu Cầu Nguyên Liệu)."""
+        """Chốt đơn / Lưu phiếu tiếp nhận vào SQLite trong 1 transaction đồng bộ thread-safe."""
         assert self.state_machine and self.scale
 
-        if override_class:
-            self.state_machine.override_current_food(override_class)
+        with self._commit_lock:
+            if override_class:
+                self.state_machine.override_current_food(override_class)
 
-        insp = self.state_machine.current_inspection
-        if insp is None:
-            insp = self.state_machine.run_inspection(
-                weight_gram=self.scale.read_filtered_weight(),
-                override_label=override_class,
-                override_quality=quality_override,
-            )
-
-        if insp.get("committed") and not order_item_id:
-            return {"ok": True, "already_committed": True, "receipt": self.state_machine.last_committed_receipt}
-
-        if quality_override in {"FRESH", "WARNING", "REJECTED"}:
-            insp["quality"]["status"] = quality_override
-            insp["quality"]["is_acceptable"] = quality_override != "REJECTED"
-
-        nut = insp["nutrition"]
-        act = nut["actual"]
-        weight_g = float(insp["weight_gram"])
-        quality_st = insp["quality"]["status"]
-
-        # Nếu đang đối chiếu với một dòng nguyên liệu trong Phiếu Yêu Cầu Nguyên Liệu
-        updated_order = None
-        if order_id and order_item_id:
-            order = get_procurement_order(order_id)
-            if not order:
-                raise ValueError("Không tìm thấy Phiếu yêu cầu nguyên liệu.")
-            target_item = next((it for it in order["items"] if it["id"] == order_item_id), None)
-            if not target_item:
-                raise ValueError("Không tìm thấy nguyên liệu cần đối chiếu trong phiếu.")
-            if nut["class_name"].lower() != target_item["class_name"].lower():
-                raise ValueError(
-                    f"Sai loại thực phẩm: đang cân '{nut['vietnamese_name']}' ({nut['class_name']}) "
-                    f"nhưng dòng cần nhập là '{target_item['food_name_vi']}' ({target_item['class_name']})."
-                )
-            if quality_st == "REJECTED":
-                raise ValueError("Thực phẩm bị đánh giá HƯ HỎNG (REJECTED), không thể tích xanh nhập kho.")
-            cur_status = str(target_item.get("status") or "PENDING").upper()
-            existing_actual = (
-                float(target_item.get("actual_gram") or 0.0)
-                if (cur_status == "PARTIAL" or (accumulate and cur_status == "COMPLETED"))
-                else 0.0
-            )
-            projected_gram = existing_actual + weight_g
-            if not allow_partial and projected_gram < float(target_item["min_acceptable_gram"]):
-                raise ValueError(
-                    f"Khối lượng chưa đạt tối thiểu 95%: hiện có {projected_gram:.1f}g "
-                    f"(yêu cầu tối thiểu {target_item['min_acceptable_gram']:.1f}g / {target_item['required_gram']:.1f}g)."
+            insp = self.state_machine.current_inspection
+            if insp is None:
+                insp = self.state_machine.run_inspection(
+                    weight_gram=self.scale.read_filtered_weight(),
+                    override_label=override_class,
+                    override_quality=quality_override,
                 )
 
-        receipt = {
-            "id": f"rec_{uuid.uuid4().hex[:12]}",
-            "batch_code": insp["batch_code"],
-            "timestamp": utc_now_iso(),
-            "local_date": local_today_str(),
-            "station_id": settings.station_id,
-            "class_name": nut["class_name"],
-            "food_name_vi": nut["vietnamese_name"],
-            "food_group": nut["food_group"],
-            "weight_gram": weight_g,
-            "edible_gram": float(nut["edible_gram"]),
-            "quality_status": quality_st,
-            "confidence": float(insp["confidence"]),
-            "inference_time_ms": int(insp["inference_time_ms"]),
-            "strategy": insp["strategy"],
-            "energy_kcal": float(act["energy_kcal"]),
-            "protein_g": float(act["protein_g"]),
-            "fat_g": float(act["fat_g"]),
-            "carbohydrate_g": float(act["carbohydrate_g"]),
-            "fiber_g": float(act["fiber_g"]),
-            "calcium_mg": float(act["calcium_mg"]),
-            "iron_mg": float(act["iron_mg"]),
-            "vitamin_c_mg": float(act["vitamin_c_mg"]),
-            "image_url": insp.get("image_url"),
-            "note": note,
-            "confirmed_by": confirmed_by,
-            "order_id": order_id or "",
-            "order_item_id": order_item_id or "",
-            "unit_price_per_kg": int(nut.get("unit_price_per_kg", 0)),
-            "total_price_vnd": int(nut.get("total_price_vnd", 0)),
-        }
+            if insp.get("committed") and not order_item_id:
+                return {"ok": True, "already_committed": True, "receipt": self.state_machine.last_committed_receipt}
 
-        insert_intake_log(receipt)
-        insp["committed"] = True
-        self.state_machine.last_committed_receipt = receipt
-        self.state_machine.mark_session_committed()
+            if quality_override in {"FRESH", "WARNING", "REJECTED"}:
+                insp["quality"]["status"] = quality_override
+                insp["quality"]["is_acceptable"] = quality_override != "REJECTED"
 
-        if order_id and order_item_id:
-            updated_order = mark_procurement_item_completed(
+            nut = insp["nutrition"]
+            act = nut["actual"]
+            weight_g = float(insp["weight_gram"])
+            quality_st = insp["quality"]["status"]
+
+            # Nếu đang đối chiếu với một dòng nguyên liệu trong Phiếu Yêu Cầu Nguyên Liệu
+            if order_id and order_item_id:
+                order = get_procurement_order(order_id)
+                if not order:
+                    raise ValueError("Không tìm thấy Phiếu yêu cầu nguyên liệu.")
+                target_item = next((it for it in order["items"] if it["id"] == order_item_id), None)
+                if not target_item:
+                    raise ValueError("Không tìm thấy nguyên liệu cần đối chiếu trong phiếu.")
+                if nut["class_name"].lower() != target_item["class_name"].lower():
+                    raise ValueError(
+                        f"Sai loại thực phẩm: đang cân '{nut['vietnamese_name']}' ({nut['class_name']}) "
+                        f"nhưng dòng cần nhập là '{target_item['food_name_vi']}' ({target_item['class_name']})."
+                    )
+                if quality_st == "REJECTED":
+                    raise ValueError("Thực phẩm bị đánh giá HƯ HỎNG (REJECTED), không thể tích xanh nhập kho.")
+                cur_status = str(target_item.get("status") or "PENDING").upper()
+                existing_actual = (
+                    float(target_item.get("actual_gram") or 0.0)
+                    if (cur_status == "PARTIAL" or (accumulate and cur_status == "COMPLETED"))
+                    else 0.0
+                )
+                projected_gram = existing_actual + weight_g
+                if not allow_partial and projected_gram < float(target_item["min_acceptable_gram"]):
+                    raise ValueError(
+                        f"Khối lượng chưa đạt tối thiểu 95%: hiện có {projected_gram:.1f}g "
+                        f"(yêu cầu tối thiểu {target_item['min_acceptable_gram']:.1f}g / {target_item['required_gram']:.1f}g)."
+                    )
+
+            final_note = (note or "").strip()
+            override_trace = str(insp.get("override_note") or "").strip()
+            if override_trace and override_trace not in final_note:
+                final_note = f"{final_note} | {override_trace}" if final_note else override_trace
+
+            receipt = {
+                "id": f"rec_{uuid.uuid4().hex[:12]}",
+                "batch_code": insp["batch_code"],
+                "timestamp": utc_now_iso(),
+                "local_date": local_today_str(),
+                "station_id": settings.station_id,
+                "class_name": nut["class_name"],
+                "food_name_vi": nut["vietnamese_name"],
+                "food_group": nut["food_group"],
+                "weight_gram": weight_g,
+                "edible_gram": float(nut["edible_gram"]),
+                "quality_status": quality_st,
+                "confidence": float(insp["confidence"]),
+                "inference_time_ms": int(insp["inference_time_ms"]),
+                "strategy": insp["strategy"],
+                "energy_kcal": float(act["energy_kcal"]),
+                "protein_g": float(act["protein_g"]),
+                "fat_g": float(act["fat_g"]),
+                "carbohydrate_g": float(act["carbohydrate_g"]),
+                "fiber_g": float(act["fiber_g"]),
+                "calcium_mg": float(act["calcium_mg"]),
+                "iron_mg": float(act["iron_mg"]),
+                "vitamin_c_mg": float(act["vitamin_c_mg"]),
+                "image_url": insp.get("image_url"),
+                "note": final_note,
+                "confirmed_by": confirmed_by,
+                "order_id": order_id or "",
+                "order_item_id": order_item_id or "",
+                "unit_price_per_kg": int(nut.get("unit_price_per_kg", 0)),
+                "total_price_vnd": int(nut.get("total_price_vnd", 0)),
+            }
+
+            updated_order = commit_intake_and_order_item_tx(
+                receipt=receipt,
                 order_id=order_id,
-                item_id=order_item_id,
+                order_item_id=order_item_id,
                 actual_gram=weight_g,
                 quality_status=quality_st,
                 confidence=float(insp["confidence"]),
                 checked_by=confirmed_by,
-                log_id=receipt["id"],
                 image_url=insp.get("image_url"),
                 accumulate=accumulate,
                 allow_partial=allow_partial,
             )
-            self._on_station_event("order_updated", {"order": updated_order})
 
-        self._on_station_event("receipt_committed", {"receipt": receipt, "snapshot": self.state_machine.snapshot()})
-        return {"ok": True, "already_committed": False, "receipt": receipt, "order": updated_order}
+            insp["committed"] = True
+            self.state_machine.last_committed_receipt = receipt
+            self.state_machine.mark_session_committed()
+
+            if updated_order is not None:
+                self._on_station_event("order_updated", {"order": updated_order})
+
+            self._on_station_event("receipt_committed", {"receipt": receipt, "snapshot": self.state_machine.snapshot()})
+            return {"ok": True, "already_committed": False, "receipt": receipt, "order": updated_order}
+
+    def reject_current_inspection(
+        self,
+        reason: str,
+        note: str = "",
+        confirmed_by: str = "Nhân viên bếp",
+    ) -> dict[str, Any]:
+        """Ghi nhận từ chối lô hàng không đạt cảm quan vào intake_logs (không cộng vào phiếu nhập kho)."""
+        assert self.state_machine and self.scale
+
+        clean_reason = (reason or "").strip()
+        if not clean_reason:
+            raise ValueError("Vui lòng chọn hoặc nhập lý do từ chối hàng.")
+
+        with self._commit_lock:
+            insp = self.state_machine.current_inspection
+            if insp is None:
+                insp = self.state_machine.run_inspection(
+                    weight_gram=self.scale.read_filtered_weight(),
+                    override_quality="REJECTED",
+                )
+
+            if insp.get("committed") and insp.get("quality_status") == "REJECTED":
+                return {"ok": True, "already_committed": True, "receipt": self.state_machine.last_committed_receipt}
+
+            insp["quality"]["status"] = "REJECTED"
+            insp["quality"]["is_acceptable"] = False
+            insp["quality"]["badge_text"] = "TỪ CHỐI NHẬP KHO - KHÔNG ĐẠT CẢM QUAN"
+            insp["quality"]["recommendation"] = f"Đã từ chối nhập kho: {clean_reason}"
+            insp["quality"]["alert_level"] = "danger"
+            insp["quality_status"] = "REJECTED"
+
+            nut = insp["nutrition"]
+            act = nut["actual"]
+            weight_g = float(insp["weight_gram"])
+
+            reject_note = f"Từ chối nhập kho - Lý do: {clean_reason}"
+            if note and note.strip():
+                reject_note = f"{reject_note} | {note.strip()}"
+            if insp.get("override_note"):
+                reject_note = f"{reject_note} | {insp['override_note']}"
+
+            receipt = {
+                "id": f"rec_{uuid.uuid4().hex[:12]}",
+                "batch_code": insp["batch_code"],
+                "timestamp": utc_now_iso(),
+                "local_date": local_today_str(),
+                "station_id": settings.station_id,
+                "class_name": nut["class_name"],
+                "food_name_vi": nut["vietnamese_name"],
+                "food_group": nut["food_group"],
+                "weight_gram": weight_g,
+                "edible_gram": float(nut["edible_gram"]),
+                "quality_status": "REJECTED",
+                "confidence": float(insp["confidence"]),
+                "inference_time_ms": int(insp["inference_time_ms"]),
+                "strategy": insp["strategy"],
+                "energy_kcal": float(act["energy_kcal"]),
+                "protein_g": float(act["protein_g"]),
+                "fat_g": float(act["fat_g"]),
+                "carbohydrate_g": float(act["carbohydrate_g"]),
+                "fiber_g": float(act["fiber_g"]),
+                "calcium_mg": float(act["calcium_mg"]),
+                "iron_mg": float(act["iron_mg"]),
+                "vitamin_c_mg": float(act["vitamin_c_mg"]),
+                "image_url": insp.get("image_url"),
+                "note": reject_note,
+                "confirmed_by": confirmed_by,
+                "order_id": "",
+                "order_item_id": "",
+                "unit_price_per_kg": int(nut.get("unit_price_per_kg", 0)),
+                "total_price_vnd": int(nut.get("total_price_vnd", 0)),
+            }
+
+            commit_intake_and_order_item_tx(receipt=receipt)
+            insp["committed"] = True
+            self.state_machine.last_committed_receipt = receipt
+            self.state_machine.mark_session_committed()
+
+            snap = self.state_machine.snapshot()
+            self._on_station_event("receipt_committed", {"receipt": receipt, "snapshot": snap})
+            self._on_station_event("state_change", snap)
+            return {"ok": True, "already_committed": False, "receipt": receipt, "snapshot": snap}
 
     def add_extra_item_to_order(
         self,

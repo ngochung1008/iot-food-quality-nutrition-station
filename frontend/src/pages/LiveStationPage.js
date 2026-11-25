@@ -7,7 +7,7 @@ import { playRejectAlarm, playSuccessBeep } from "../assets/js/alertSound.js";
 import { renderLiveCameraCard, updateLiveCameraCard } from "../components/LiveCameraCard.js";
 import { renderNutritionTable, updateNutritionTable } from "../components/NutritionTable.js";
 import { renderWeightGauge, updateWeightGauge } from "../components/WeightGauge.js";
-import { apiClient } from "../services/apiClient.js";
+import { apiClient, getAuthSession } from "../services/apiClient.js";
 
 export class LiveStationPage {
   constructor(toast) {
@@ -267,6 +267,7 @@ export class LiveStationPage {
       });
 
       document.getElementById("btn-demo-reset-order")?.addEventListener("click", async () => {
+        if (!window.confirm("Bạn có chắc muốn reset toàn bộ tiến độ cân của phiếu này về 0%?")) return;
         try {
           const res = await apiClient.resetOrder(order.id);
           this.lastInspectionCode = null;
@@ -321,13 +322,14 @@ export class LiveStationPage {
               <button id="btn-add-extra-item" class="btn btn-sm btn-green" type="button" ${isRejected ? "disabled" : ""}>
                 + Bổ sung vào phiếu &amp; Tích xanh
               </button>
-              <button id="btn-commit-extra-loose" class="btn btn-sm btn-outline" type="button">
-                Lưu nhập lẻ ngoài phiếu
+              <button id="btn-commit-extra-loose" class="btn btn-sm ${isRejected ? "btn-danger" : "btn-outline"}" type="button">
+                ${isRejected ? "Ghi nhận từ chối (Không nhập kho)" : "Lưu nhập lẻ ngoài phiếu"}
               </button>
             </div>
           </div>`;
 
         document.getElementById("btn-add-extra-item")?.addEventListener("click", async () => {
+          const { user } = getAuthSession();
           try {
             const res = await apiClient.addExtraOrderItem(order.id, {
               class_name: detectedClass,
@@ -340,7 +342,7 @@ export class LiveStationPage {
             }
             if (res?.order) this.onOrderEvent(res.order);
             this.update(this.lastSnapshot, true);
-            this.toast(`Đã bổ sung & tích xanh: ${foodVi}`, "success");
+            this.toast(`Đã bổ sung & tích xanh: ${foodVi}${user?.full_name ? ` (${user.full_name})` : ""}`, "success");
           } catch (err) {
             playRejectAlarm();
             this.toast(err.message, "error");
@@ -348,10 +350,25 @@ export class LiveStationPage {
         });
 
         document.getElementById("btn-commit-extra-loose")?.addEventListener("click", async () => {
+          const { user } = getAuthSession();
+          const actor = user?.full_name || "Nhân viên tiếp nhận";
           try {
+            if (isRejected) {
+              const res = await apiClient.rejectInspection({
+                reason: "Hàng hư hỏng / không đạt cảm quan",
+                confirmed_by: actor,
+              });
+              if (res?.ok) {
+                playRejectAlarm();
+                if (res.snapshot) this.update(res.snapshot, true);
+                this.toast(`Đã ghi nhận từ chối (Không nhập kho): ${foodVi}`, "warning");
+              }
+              return;
+            }
             const res = await apiClient.commitReceipt({
               override_class: detectedClass,
               note: "Nhập lẻ ngoài phiếu tại trạm",
+              confirmed_by: actor,
             });
             if (res?.ok) {
               playSuccessBeep();
@@ -536,6 +553,7 @@ export class LiveStationPage {
         this.toast("Chưa có phiếu đang chọn để reset.", "warning");
         return;
       }
+      if (!window.confirm("Bạn có chắc muốn reset toàn bộ tiến độ cân của phiếu này về 0%?")) return;
       try {
         const res = await apiClient.resetOrder(this.activeOrderId);
         this.lastInspectionCode = null;
@@ -582,6 +600,13 @@ export class LiveStationPage {
     });
 
     document.getElementById("btn-tare")?.addEventListener("click", async () => {
+      const currentW = Number(this.lastSnapshot?.weight_gram || 0);
+      if (currentW > 20.0) {
+        const ok = window.confirm(
+          `Đĩa cân đang có tải ${currentW.toFixed(1)}g (dùng để trừ bì rổ/khay đựng). Bạn có chắc chắn muốn đặt mức này về 0.0g?`
+        );
+        if (!ok) return;
+      }
       try {
         const res = await apiClient.tare();
         this.lastInspectionCode = null;
@@ -591,6 +616,36 @@ export class LiveStationPage {
         this.toast("Đã đưa cân về 0.0g (Tare)", "success");
       } catch (e) {
         this.toast(`Lỗi Tare: ${e.message}`, "error");
+      }
+    });
+
+    const rejectPanel = document.getElementById("wg-reject-panel");
+    document.getElementById("btn-reject-goods")?.addEventListener("click", () => {
+      if (rejectPanel) {
+        rejectPanel.style.display = rejectPanel.style.display === "none" ? "block" : "none";
+      }
+    });
+    document.getElementById("btn-cancel-reject")?.addEventListener("click", () => {
+      if (rejectPanel) rejectPanel.style.display = "none";
+    });
+    document.getElementById("btn-confirm-reject")?.addEventListener("click", async () => {
+      const reason = document.getElementById("reject-reason-select")?.value || "Không đạt cảm quan";
+      const note = document.getElementById("reject-note-input")?.value.trim() || "";
+      const { user } = getAuthSession();
+      try {
+        const res = await apiClient.rejectInspection({
+          reason,
+          note,
+          confirmed_by: user?.full_name || "Nhân viên bếp",
+        });
+        playRejectAlarm();
+        if (rejectPanel) rejectPanel.style.display = "none";
+        const noteEl = document.getElementById("reject-note-input");
+        if (noteEl) noteEl.value = "";
+        if (res?.snapshot) this.update(res.snapshot, true);
+        this.toast(`Đã ghi nhận từ chối hàng: ${reason}`, "warning");
+      } catch (e) {
+        this.toast(`Lỗi từ chối hàng: ${e.message}`, "error");
       }
     });
 
@@ -622,9 +677,10 @@ export class LiveStationPage {
     });
 
     document.getElementById("btn-reset-active-order")?.addEventListener("click", async () => {
+      if (!this.activeOrderId) return;
+      if (!window.confirm("Bạn có chắc muốn reset toàn bộ tiến độ cân của phiếu này về 0%?")) return;
       const promptBox = document.getElementById("wg-reset-order-prompt");
       if (promptBox) promptBox.style.display = "none";
-      if (!this.activeOrderId) return;
       try {
         const res = await apiClient.resetOrder(this.activeOrderId);
         this.lastInspectionCode = null;
