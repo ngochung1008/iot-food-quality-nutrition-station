@@ -40,6 +40,12 @@ class NutritionStationStateMachine:
         self.current_inspection: dict[str, Any] | None = None
         self.last_committed_receipt: dict[str, Any] | None = None
         self._session_committed: bool = False
+        self._batch_accumulated_in_current_load: bool = False
+        self._active_batch_log_id: str | None = None
+        self._active_batch_order_id: str | None = None
+        self._active_batch_item_id: str | None = None
+        self._active_batch_class: str | None = None
+        self._active_batch_weight_g: float = 0.0
         self._below_idle_count: int = 0
         self._last_lcd_state: str = ""
         self._last_lcd_weight: float = -999.0
@@ -107,6 +113,12 @@ class NutritionStationStateMachine:
             self.state = StationState.IDLE
             self.current_inspection = None
             self._session_committed = False
+            self._batch_accumulated_in_current_load = False
+            self._active_batch_log_id = None
+            self._active_batch_order_id = None
+            self._active_batch_item_id = None
+            self._active_batch_class = None
+            self._active_batch_weight_g = 0.0
             self._below_idle_count = 0
             self.scale.station_state = self.state.value
             if hasattr(self.scale, "reset_stability"):
@@ -131,6 +143,12 @@ class NutritionStationStateMachine:
         self.state = StationState.IDLE
         self.current_inspection = None
         self._session_committed = False
+        self._batch_accumulated_in_current_load = False
+        self._active_batch_log_id = None
+        self._active_batch_order_id = None
+        self._active_batch_item_id = None
+        self._active_batch_class = None
+        self._active_batch_weight_g = 0.0
         self._below_idle_count = 0
         if self.camera:
             self.camera.set_overlay_detections([])
@@ -388,11 +406,18 @@ class NutritionStationStateMachine:
         }
 
         with self._lock:
+            prev_state_before_inspect = self.state
             self.current_inspection = inspection_result
             if w >= settings.idle_weight_g:
                 self.state = StationState.CHECKOUT
             target_order_id = self.active_order_id
             already_committed_in_session = self._session_committed
+            batch_accumulated = self._batch_accumulated_in_current_load
+            active_batch_log_id = self._active_batch_log_id
+            active_batch_order_id = self._active_batch_order_id
+            active_batch_item_id = self._active_batch_item_id
+            active_batch_class = self._active_batch_class
+            active_batch_weight_g = self._active_batch_weight_g
 
         if self.lcd:
             self.lcd.display_station_status(
@@ -408,50 +433,86 @@ class NutritionStationStateMachine:
             self._last_lcd_weight = w
             self._last_lcd_update_ts = time.time()
 
-        # Chỉ tự động cộng dồn / TÍCH XANH khi chất lượng đạt FRESH (chặn auto-record khi WARNING hoặc REJECTED)
+        # Chỉ tự động cộng dồn / TÍCH XANH 1 lần cho mỗi lượt đặt vật (tới khi về IDLE);
+        # nếu vật chưa được nhấc ra khỏi cân (_batch_accumulated_in_current_load == True) thì chỉ điều chỉnh phần delta_gram.
         auto_checked = False
-        allow_auto_record = (not already_committed_in_session) or (override_label is not None and weight_gram is None)
-        if allow_auto_record and target_order_id and w >= settings.detect_weight_g and quality.get("status") == "FRESH":
+        if target_order_id and w >= settings.detect_weight_g and quality.get("status") == "FRESH":
             from backend.database.crud import get_procurement_order
             from backend.services.station_service import station_service
 
             order = get_procurement_order(target_order_id)
-            if order and order.get("status") in {"PENDING", "IN_PROGRESS"}:
-                matched_item = next(
-                    (
-                        it
-                        for it in order["items"]
-                        if it["status"] != "COMPLETED"
-                        and (
-                            it["status"] in {"PENDING", "PARTIAL"}
-                            or float(it.get("actual_gram") or 0.0) < float(it.get("min_acceptable_gram") or 0.0)
-                        )
-                        and it["class_name"].lower() == nutrition["class_name"].lower()
-                    ),
-                    None,
-                )
-                if matched_item is not None:
-                    try:
-                        station_service.commit_current_inspection(
-                            order_id=target_order_id,
-                            order_item_id=matched_item["id"],
-                            confirmed_by="Trạm cân AI (Tự động đối chiếu)",
-                            note="Tự động đối chiếu & cộng dồn tại trạm",
-                            accumulate=True,
-                            allow_partial=True,
-                        )
-                        auto_checked = True
-                        with self._lock:
-                            self._session_committed = True
-                    except Exception as exc:
-                        logger.warning(f"[STATE] Auto đối chiếu bỏ qua: {exc}")
+            same_active_class = bool(
+                active_batch_class and active_batch_class.lower() == nutrition["class_name"].lower()
+            )
+            if batch_accumulated and same_active_class:
+                if (
+                    active_batch_log_id
+                    and active_batch_order_id == target_order_id
+                    and active_batch_item_id
+                ):
+                    cur_item = next((it for it in (order["items"] if order else []) if it["id"] == active_batch_item_id), None)
+                    should_adjust = cur_item is not None and cur_item.get("status") != "COMPLETED"
+                    delta_gram = round(round(w, 1) - float(active_batch_weight_g), 1)
+                    if should_adjust and abs(delta_gram) >= 0.1:
+                        try:
+                            station_service.adjust_current_batch_item(
+                                log_id=active_batch_log_id,
+                                order_id=target_order_id,
+                                order_item_id=active_batch_item_id,
+                                delta_gram=delta_gram,
+                                inspection=inspection_result,
+                            )
+                            with self._lock:
+                                self._active_batch_weight_g = round(w, 1)
+                        except Exception as exc:
+                            logger.warning(f"[STATE] Lỗi điều chỉnh delta_gram mẻ hiện tại: {exc}")
+                    else:
+                        inspection_result["committed"] = True
+                auto_checked = True
+            elif (not already_committed_in_session) or (override_label is not None and (not batch_accumulated or not same_active_class)):
+                if order and order.get("status") in {"PENDING", "IN_PROGRESS"}:
+                    matched_item = next(
+                        (
+                            it
+                            for it in order["items"]
+                            if it["status"] != "COMPLETED"
+                            and (
+                                it["status"] in {"PENDING", "PARTIAL"}
+                                or float(it.get("actual_gram") or 0.0) < float(it.get("min_acceptable_gram") or 0.0)
+                            )
+                            and it["class_name"].lower() == nutrition["class_name"].lower()
+                        ),
+                        None,
+                    )
+                    if matched_item is not None:
+                        try:
+                            commit_res = station_service.commit_current_inspection(
+                                order_id=target_order_id,
+                                order_item_id=matched_item["id"],
+                                confirmed_by="Trạm cân AI (Tự động đối chiếu)",
+                                note="Tự động đối chiếu & cộng dồn tại trạm",
+                                accumulate=True,
+                                allow_partial=True,
+                            )
+                            auto_checked = True
+                            with self._lock:
+                                self._session_committed = True
+                                self._batch_accumulated_in_current_load = True
+                                self._active_batch_log_id = (commit_res.get("receipt") or {}).get("id")
+                                self._active_batch_order_id = target_order_id
+                                self._active_batch_item_id = matched_item["id"]
+                                self._active_batch_class = nutrition["class_name"]
+                                self._active_batch_weight_g = round(w, 1)
+                        except Exception as exc:
+                            logger.warning(f"[STATE] Auto đối chiếu bỏ qua: {exc}")
 
-        if allow_auto_record and not auto_checked and self.auto_commit and w >= settings.idle_weight_g and quality.get("status") == "FRESH":
+        if (not batch_accumulated) and (not already_committed_in_session) and not auto_checked and self.auto_commit and w >= settings.idle_weight_g and quality.get("status") == "FRESH":
             from backend.services.station_service import station_service
 
             station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định", accumulate=False)
             with self._lock:
                 self._session_committed = True
+                self._batch_accumulated_in_current_load = True
 
         self._emit("inspection_result", self.snapshot())
         return inspection_result

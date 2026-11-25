@@ -1328,6 +1328,131 @@ def commit_intake_and_order_item_tx(
         return None
 
 
+def adjust_current_batch_item_tx(
+    log_id: str,
+    order_id: str,
+    order_item_id: str,
+    delta_gram: float,
+    new_weight_gram: float,
+    new_edible_gram: float,
+    new_nutrition_actual: dict[str, Any],
+    new_total_price_vnd: int,
+    quality_status: str,
+    confidence: float,
+    image_url: str | None = None,
+) -> dict[str, Any] | None:
+    """Điều chỉnh phần chênh lệch trọng lượng (delta_gram) của chính mẻ đang đặt trên cân trong 1 transaction."""
+    now = utc_now_iso()
+    with get_db_conn() as conn:
+        log_row = conn.execute("SELECT * FROM intake_logs WHERE id = ?", (log_id,)).fetchone()
+        item_row = conn.execute(
+            "SELECT * FROM procurement_items WHERE id = ? AND order_id = ?",
+            (order_item_id, order_id),
+        ).fetchone()
+        if not item_row:
+            return None
+
+        if log_row is not None:
+            old_w_kg = round(float(log_row["weight_gram"] or 0.0) / 1000.0, 4)
+            new_w_kg = round(float(new_weight_gram) / 1000.0, 4)
+            diff_w_kg = new_w_kg - old_w_kg
+
+            is_accepted = str(log_row["quality_status"] or "FRESH") != "REJECTED"
+            diff_acc_kg = diff_w_kg if is_accepted else 0.0
+            diff_kcal = (float(new_nutrition_actual.get("energy_kcal", 0.0)) - float(log_row["energy_kcal"] or 0.0)) if is_accepted else 0.0
+            diff_p = (float(new_nutrition_actual.get("protein_g", 0.0)) - float(log_row["protein_g"] or 0.0)) if is_accepted else 0.0
+            diff_f = (float(new_nutrition_actual.get("fat_g", 0.0)) - float(log_row["fat_g"] or 0.0)) if is_accepted else 0.0
+            diff_c = (float(new_nutrition_actual.get("carbohydrate_g", 0.0)) - float(log_row["carbohydrate_g"] or 0.0)) if is_accepted else 0.0
+            diff_fib = (float(new_nutrition_actual.get("fiber_g", 0.0)) - float(log_row["fiber_g"] or 0.0)) if is_accepted else 0.0
+
+            conn.execute(
+                """
+                UPDATE intake_logs
+                SET weight_gram = ?, edible_gram = ?, quality_status = ?, confidence = ?,
+                    energy_kcal = ?, protein_g = ?, fat_g = ?, carbohydrate_g = ?, fiber_g = ?,
+                    calcium_mg = ?, iron_mg = ?, vitamin_c_mg = ?,
+                    total_price_vnd = ?, image_url = COALESCE(?, image_url)
+                WHERE id = ?
+                """,
+                (
+                    round(float(new_weight_gram), 1),
+                    round(float(new_edible_gram), 1),
+                    quality_status,
+                    round(float(confidence), 3),
+                    float(new_nutrition_actual.get("energy_kcal", 0.0)),
+                    float(new_nutrition_actual.get("protein_g", 0.0)),
+                    float(new_nutrition_actual.get("fat_g", 0.0)),
+                    float(new_nutrition_actual.get("carbohydrate_g", 0.0)),
+                    float(new_nutrition_actual.get("fiber_g", 0.0)),
+                    float(new_nutrition_actual.get("calcium_mg", 0.0)),
+                    float(new_nutrition_actual.get("iron_mg", 0.0)),
+                    float(new_nutrition_actual.get("vitamin_c_mg", 0.0)),
+                    int(new_total_price_vnd),
+                    image_url,
+                    log_id,
+                ),
+            )
+
+            conn.execute(
+                """
+                UPDATE daily_nutrition_analytics
+                SET total_weight_kg = MAX(0.0, ROUND(total_weight_kg + ?, 3)),
+                    accepted_weight_kg = MAX(0.0, ROUND(accepted_weight_kg + ?, 3)),
+                    total_kcal = MAX(0.0, ROUND(total_kcal + ?, 1)),
+                    total_protein_g = MAX(0.0, ROUND(total_protein_g + ?, 1)),
+                    total_fat_g = MAX(0.0, ROUND(total_fat_g + ?, 1)),
+                    total_carb_g = MAX(0.0, ROUND(total_carb_g + ?, 1)),
+                    total_fiber_g = MAX(0.0, ROUND(total_fiber_g + ?, 1))
+                WHERE date = ?
+                """,
+                (
+                    diff_w_kg, diff_acc_kg, diff_kcal, diff_p, diff_f, diff_c, diff_fib,
+                    log_row["local_date"],
+                ),
+            )
+
+        new_actual_gram = max(0.0, round(float(item_row["actual_gram"] or 0.0) + float(delta_gram), 1))
+        min_acc = float(item_row["min_acceptable_gram"] or 0.0)
+        new_status = "PARTIAL" if new_actual_gram < min_acc else "COMPLETED"
+
+        conn.execute(
+            """
+            UPDATE procurement_items
+            SET actual_gram = ?, quality_status = ?, confidence = ?,
+                status = ?, checked_at = ?, image_url = COALESCE(?, image_url)
+            WHERE id = ?
+            """,
+            (
+                new_actual_gram,
+                quality_status,
+                round(float(confidence), 3),
+                new_status,
+                now,
+                image_url,
+                order_item_id,
+            ),
+        )
+
+        pending = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM procurement_items WHERE order_id = ? AND status != 'COMPLETED'",
+            (order_id,),
+        ).fetchone()["cnt"]
+
+        if pending == 0:
+            conn.execute(
+                "UPDATE procurement_orders SET status = 'COMPLETED', completed_at = ? WHERE id = ?",
+                (now, order_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE procurement_orders SET status = 'IN_PROGRESS', completed_at = NULL WHERE id = ?",
+                (order_id,),
+            )
+
+        order_row = conn.execute("SELECT * FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        return _hydrate_order(conn, order_row)
+
+
 def list_intake_logs(
     limit: int = 100,
     date_from: str | None = None,

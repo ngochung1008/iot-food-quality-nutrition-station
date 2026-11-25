@@ -14,6 +14,7 @@ from backend.core.config import settings
 from backend.core.state_machine import NutritionStationStateMachine
 from backend.database.crud import (
     add_procurement_order_item,
+    adjust_current_batch_item_tx,
     commit_intake_and_order_item_tx,
     get_procurement_order,
     init_database,
@@ -379,6 +380,39 @@ class StationService:
 
             self._on_station_event("receipt_committed", {"receipt": receipt, "snapshot": self.state_machine.snapshot()})
             return {"ok": True, "already_committed": False, "receipt": receipt, "order": updated_order}
+
+    def adjust_current_batch_item(
+        self,
+        log_id: str,
+        order_id: str,
+        order_item_id: str,
+        delta_gram: float,
+        inspection: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Điều chỉnh phần chênh lệch trọng lượng (delta_gram) của chính mẻ đang nằm trên cân, không cộng đúp."""
+        assert self.state_machine
+        with self._commit_lock:
+            nut = inspection["nutrition"]
+            act = nut["actual"]
+            new_w = float(inspection["weight_gram"])
+            quality_st = inspection["quality"]["status"]
+            updated_order = adjust_current_batch_item_tx(
+                log_id=log_id,
+                order_id=order_id,
+                order_item_id=order_item_id,
+                delta_gram=delta_gram,
+                new_weight_gram=new_w,
+                new_edible_gram=float(nut["edible_gram"]),
+                new_nutrition_actual=act,
+                new_total_price_vnd=int(nut.get("total_price_vnd", 0)),
+                quality_status=quality_st,
+                confidence=float(inspection["confidence"]),
+                image_url=inspection.get("image_url"),
+            )
+            inspection["committed"] = True
+            if updated_order is not None:
+                self._on_station_event("order_updated", {"order": updated_order})
+            return {"ok": True, "adjusted": True, "delta_gram": round(delta_gram, 1), "order": updated_order}
 
     def reject_current_inspection(
         self,

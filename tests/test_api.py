@@ -1344,3 +1344,102 @@ def test_commercial_quality_guards_and_excel_export():
         client.delete(f"/api/kitchen/orders/{order_id}", headers=chef_hdr)
         client.delete(f"/api/logs/{ovr_rec['id']}", headers=admin_hdr)
         client.delete(f"/api/logs/{rej_rec['id']}", headers=admin_hdr)
+
+
+def test_no_duplicate_accumulation_until_scale_returns_to_idle():
+    """Khóa cộng dồn theo chu kỳ về IDLE: quét lại / dao động trên cân chỉ điều chỉnh delta_gram, không cộng đúp."""
+    from backend.core.constants import StationState
+    from backend.services.station_service import station_service
+
+    with TestClient(app) as client:
+        admin_hdr = _login(client, "admin", "admin123")
+        chef_hdr = _login(client, "chef", "chef123")
+        recv_hdr = _login(client, "receiver", "receiver123")
+
+        # 1. Tạo món Pork 500g và phiếu 1 suất (500g Pork)
+        r_dish = client.post(
+            "/api/kitchen/dishes",
+            headers=chef_hdr,
+            json={
+                "name_vi": "Thịt heo test khóa cộng dồn (500g)",
+                "category": "Món mặn chính",
+                "ingredients": [{"class_name": "Pork", "grams_per_serving": 500.0}],
+            },
+        )
+        assert r_dish.status_code == 200, r_dish.text
+        dish_id = r_dish.json()["id"]
+
+        r_ord = client.post(
+            "/api/kitchen/orders",
+            headers=chef_hdr,
+            json={
+                "title": "Phiếu test 500g Pork",
+                "meal_date": "2026-11-25",
+                "meal_shift": "Bữa trưa",
+                "servings": 1,
+                "dish_ids": [dish_id],
+                "tolerance_percent": 5.0,
+            },
+        )
+        assert r_ord.status_code == 200, r_ord.text
+        order_id = r_ord.json()["id"]
+        pork_item_id = r_ord.json()["items"][0]["id"]
+
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/active-order", json={"order_id": order_id})
+
+        # 2. Đặt 200g Pork lên cân -> AI nhận Pork -> actual_gram = 200.0g (PARTIAL)
+        client.post("/api/station/simulate/weight", json={"weight_gram": 200.0})
+        r1 = client.post("/api/station/inspect", json={"override_label": "Pork", "override_quality": "FRESH"})
+        assert r1.status_code == 200
+        sm = station_service.state_machine
+        assert sm._batch_accumulated_in_current_load is True
+
+        ord_1 = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        pork_1 = next(i for i in ord_1["items"] if i["id"] == pork_item_id)
+        assert pork_1["status"] == "PARTIAL"
+        assert pork_1["actual_gram"] == 200.0
+        log1_id = pork_1["log_id"]
+
+        # 3. KHÔNG nhấc vật ra: trọng lượng dao động sang 203g & quét lại -> chỉ điều chỉnh thành 203.0g (KHÔNG thành 403.0g)
+        client.post("/api/station/simulate/weight", json={"weight_gram": 203.0})
+        r2 = client.post("/api/station/inspect", json={"override_label": "Pork", "override_quality": "FRESH"})
+        assert r2.status_code == 200
+        ord_2 = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        pork_2 = next(i for i in ord_2["items"] if i["id"] == pork_item_id)
+        assert pork_2["actual_gram"] == 203.0
+
+        # Kiểm tra thêm trường hợp dao động > ±5g (203g -> 210g) khi CHECKOUT -> về STABILIZING nhưng KHÔNG reset cờ khóa cộng dồn
+        sm.scale.set_simulated_weight(210.0)
+        sm.update()
+        assert sm.state == StationState.STABILIZING
+        assert sm._batch_accumulated_in_current_load is True
+
+        # Quét lại ở 210g -> chỉ điều chỉnh thành 210.0g (không cộng đúp)
+        client.post("/api/station/inspect", json={"override_label": "Pork", "override_quality": "FRESH"})
+        ord_2b = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        pork_2b = next(i for i in ord_2b["items"] if i["id"] == pork_item_id)
+        assert pork_2b["actual_gram"] == 210.0
+
+        # 4. Nhấc vật ra (0.0g về IDLE trong 3 nhịp) -> reset cờ khóa -> đặt mẻ thứ 2 (150g) -> cộng dồn thành 210 + 150 = 360.0g
+        sm.scale.set_simulated_weight(0.0)
+        for _ in range(4):
+            sm.update()
+        assert sm.state == StationState.IDLE
+        assert sm._batch_accumulated_in_current_load is False
+
+        client.post("/api/station/simulate/weight", json={"weight_gram": 150.0})
+        r3 = client.post("/api/station/inspect", json={"override_label": "Pork", "override_quality": "FRESH"})
+        assert r3.status_code == 200
+        ord_3 = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        pork_3 = next(i for i in ord_3["items"] if i["id"] == pork_item_id)
+        assert pork_3["actual_gram"] == 360.0
+        log2_id = pork_3["log_id"]
+
+        # Dọn dẹp
+        client.delete(f"/api/kitchen/orders/{order_id}", headers=chef_hdr)
+        client.delete(f"/api/kitchen/dishes/{dish_id}", headers=chef_hdr)
+        if log1_id:
+            client.delete(f"/api/logs/{log1_id}", headers=admin_hdr)
+        if log2_id and log2_id != log1_id:
+            client.delete(f"/api/logs/{log2_id}", headers=admin_hdr)
