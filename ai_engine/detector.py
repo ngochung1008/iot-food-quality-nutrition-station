@@ -22,6 +22,17 @@ from backend.core.constants import CONFIDENCE_HIGH_THRESHOLD, ROTTEN_KEYWORDS, Q
 
 logger = logging.getLogger("nutrition_station.ai.detector")
 
+COARSE_CANDIDATE_THRESHOLD = 0.15
+OVERLAP_IOU_THRESHOLD = 0.65
+
+CONFUSION_PAIRS: tuple[set[str], ...] = (
+    {"Egg", "Chicken"},
+    {"Potato", "Sweet Potato", "Ginger"},
+    {"Lemon", "Lime"},
+    {"Red Onion", "Beetroot"},
+    {"White Onion", "Garlic"},
+)
+
 DEFAULT_64_CLASSES: list[str] = [
     "Apple", "Apricot", "Asparagus", "Avocado", "Banana", "Beef", "Beetroot",
     "Bell Pepper", "Berry", "Cabbage", "Cantaloupe", "Carrot", "Cashew Nut",
@@ -117,8 +128,195 @@ class BaseAIDetector(ABC):
         return True
 
     @abstractmethod
-    def predict(self, frame: np.ndarray, weight_gram: float = 0.0) -> dict[str, Any]:
+    def predict(
+        self,
+        frame: np.ndarray,
+        weight_gram: float = 0.0,
+        expected_classes: list[str] | None = None,
+    ) -> dict[str, Any]:
         raise NotImplementedError
+
+
+def _strip_quality_prefix(label: str) -> str:
+    cleaned = (label or "").strip()
+    for prefix in ("Fresh_", "Rotten_", "fresh_", "rotten_"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+    return cleaned.strip()
+
+
+def _box_iou(box_a: dict[str, Any], box_b: dict[str, Any]) -> float:
+    """Tính IoU giữa 2 bounding box dạng {x1, y1, x2, y2}."""
+    ax1, ay1, ax2, ay2 = float(box_a["x1"]), float(box_a["y1"]), float(box_a["x2"]), float(box_a["y2"])
+    bx1, by1, bx2, by2 = float(box_b["x1"]), float(box_b["y1"]), float(box_b["x2"]), float(box_b["y2"])
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _merge_overlapping_candidates(
+    detections: list[dict[str, Any]],
+    iou_threshold: float = OVERLAP_IOU_THRESHOLD,
+    min_score: float = COARSE_CANDIDATE_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """Gộp các ứng viên lớp có IoU >= 0.65 và score >= 0.15 vào top_candidates (tối đa 3 lớp) của box chính."""
+    if not detections:
+        return []
+    ordered = sorted(detections, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+    kept: list[dict[str, Any]] = []
+
+    for det in ordered:
+        det_cands = det.get("top_candidates") or [
+            {"class_id": det.get("class_id", -1), "label": det["label"], "confidence": float(det["confidence"])}
+        ]
+        merged_into = None
+        for anchor in kept:
+            if _box_iou(anchor["box"], det["box"]) >= iou_threshold:
+                merged_into = anchor
+                break
+
+        if merged_into is not None:
+            pool: dict[str, dict[str, Any]] = {}
+            for c in list(merged_into.get("top_candidates", [])) + list(det_cands):
+                lbl = str(c.get("label", ""))
+                conf = float(c.get("confidence", 0.0))
+                if not lbl or conf < min_score:
+                    continue
+                prev = pool.get(lbl)
+                if prev is None or conf > float(prev["confidence"]):
+                    pool[lbl] = {
+                        "class_id": int(c.get("class_id", -1)),
+                        "label": lbl,
+                        "confidence": round(conf, 3),
+                    }
+            merged_into["top_candidates"] = sorted(
+                pool.values(), key=lambda x: float(x["confidence"]), reverse=True
+            )[:3]
+        else:
+            pool = {}
+            for c in det_cands:
+                lbl = str(c.get("label", ""))
+                conf = float(c.get("confidence", 0.0))
+                if not lbl or conf < min_score:
+                    continue
+                prev = pool.get(lbl)
+                if prev is None or conf > float(prev["confidence"]):
+                    pool[lbl] = {
+                        "class_id": int(c.get("class_id", -1)),
+                        "label": lbl,
+                        "confidence": round(conf, 3),
+                    }
+            det_copy = dict(det)
+            det_copy["top_candidates"] = sorted(
+                pool.values(), key=lambda x: float(x["confidence"]), reverse=True
+            )[:3]
+            kept.append(det_copy)
+
+    return kept[:8]
+
+
+def _in_same_confusion_pair(label_a: str, label_b: str) -> bool:
+    a = _strip_quality_prefix(label_a).lower()
+    b = _strip_quality_prefix(label_b).lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    for group in CONFUSION_PAIRS:
+        lower_group = {g.lower() for g in group}
+        if a in lower_group and b in lower_group:
+            return True
+    return False
+
+
+def _rerank_with_context_and_weight(
+    top_candidates: list[dict[str, Any]],
+    weight_gram: float = 0.0,
+    expected_classes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Hiệu chỉnh điểm ứng viên dựa trên trọng lượng thực tế (Loadcell) & ngữ cảnh phiếu yêu cầu."""
+    if not top_candidates:
+        return {"selected": None, "candidates": [], "reranked": False}
+
+    ordered = sorted(top_candidates, key=lambda c: float(c.get("confidence", 0.0)), reverse=True)
+    top1_raw_label = str(ordered[0].get("label", "Unknown"))
+    top1_clean = _strip_quality_prefix(top1_raw_label)
+    top1_conf = float(ordered[0].get("confidence", 0.0))
+
+    expected_set = {_strip_quality_prefix(str(x)).lower() for x in (expected_classes or []) if str(x).strip()}
+    has_non_egg_alt = any(
+        _strip_quality_prefix(str(c.get("label", ""))) in {"Chicken", "Potato", "Sweet Potato"}
+        and float(c.get("confidence", 0.0)) >= COARSE_CANDIDATE_THRESHOLD
+        for c in ordered
+    )
+
+    scored: list[dict[str, Any]] = []
+    for cand in ordered:
+        raw_label = str(cand.get("label", "Unknown"))
+        clean_label = _strip_quality_prefix(raw_label)
+        raw_conf = float(cand.get("confidence", 0.0))
+        is_expected = clean_label.lower() in expected_set
+        score = raw_conf
+        reasons: list[str] = []
+
+        # 1. Ràng buộc vật lý theo trọng lượng
+        if 25.0 <= weight_gram <= 85.0 and top1_clean in {"Chicken", "Potato"}:
+            if clean_label == "Egg" and raw_conf >= COARSE_CANDIDATE_THRESHOLD:
+                score += 0.50
+                reasons.append("weight_egg_match(+0.50)")
+        elif weight_gram >= 250.0 and top1_clean == "Egg":
+            if clean_label == "Egg" and has_non_egg_alt:
+                score -= 0.35
+                reasons.append("weight_too_heavy_for_single_egg(-0.35)")
+
+        # 2. Ưu tiên khớp ngữ cảnh phiếu nhập
+        if is_expected:
+            is_pair = _in_same_confusion_pair(clean_label, top1_clean)
+            if raw_conf >= 0.20 or (is_pair and raw_conf >= COARSE_CANDIDATE_THRESHOLD):
+                score += 0.25
+                reasons.append("expected_order(+0.25)")
+
+        scored.append(
+            {
+                "class_id": int(cand.get("class_id", -1)),
+                "label": raw_label,
+                "confidence": round(raw_conf, 3),
+                "reranked_score": round(max(0.0, score), 3),
+                "is_expected": is_expected,
+                "reasons": reasons,
+            }
+        )
+
+    scored.sort(
+        key=lambda c: (float(c["reranked_score"]), bool(c["is_expected"]), float(c["confidence"])),
+        reverse=True,
+    )
+    selected = scored[0]
+    reranked = _strip_quality_prefix(selected["label"]) != top1_clean
+
+    if reranked or selected["reasons"]:
+        logger.info(
+            f"[AI Rerank] {top1_raw_label} ({top1_conf:.2f}) -> {selected['label']} "
+            f"(raw={selected['confidence']:.2f}, score={selected['reranked_score']:.2f}, "
+            f"weight={weight_gram:.1f}g, expected={selected['is_expected']})"
+        )
+
+    return {
+        "selected": selected,
+        "candidates": scored,
+        "reranked": reranked,
+    }
 
 
 class MockAIDetector(BaseAIDetector):
@@ -141,7 +339,12 @@ class MockAIDetector(BaseAIDetector):
         if self._forced_label:
             self._current_mock_label = self._forced_label
 
-    def predict(self, frame: np.ndarray, weight_gram: float = 0.0) -> dict[str, Any]:
+    def predict(
+        self,
+        frame: np.ndarray,
+        weight_gram: float = 0.0,
+        expected_classes: list[str] | None = None,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         time.sleep(0.03)
 
@@ -172,11 +375,19 @@ class MockAIDetector(BaseAIDetector):
                     "x2": int(w * 0.76),
                     "y2": int(h * 0.84),
                 },
+                "top_candidates": [{"class_id": -1, "label": label, "confidence": round(conf, 3)}],
             }
         ]
-        annotated = draw_detections(frame, detections)
         elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
-        return _pack_prediction(detections, annotated, elapsed_ms, strategy="mock")
+        return _pack_prediction(
+            detections,
+            frame=frame,
+            inference_time_ms=elapsed_ms,
+            strategy="mock",
+            weight_gram=weight_gram,
+            expected_classes=expected_classes,
+            conf_threshold=settings.ai_confidence_threshold,
+        )
 
 
 class NCNNYoloDetector(BaseAIDetector):
@@ -285,18 +496,24 @@ class NCNNYoloDetector(BaseAIDetector):
     def force_next(self, label: str | None = None, quality: str | None = None) -> None:
         self._fallback.force_next(label=label, quality=quality)
 
-    def predict(self, frame: np.ndarray, weight_gram: float = 0.0) -> dict[str, Any]:
-        """Thực hiện suy luận và trả về bounding boxes, nhãn, độ tin cậy, FPS."""
+    def predict(
+        self,
+        frame: np.ndarray,
+        weight_gram: float = 0.0,
+        expected_classes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Thực hiện suy luận và trả về bounding boxes, nhãn (đã rerank), độ tin cậy, FPS."""
         if frame is None or frame.size == 0:
-            return _pack_prediction([], np.zeros((480, 640, 3), dtype=np.uint8), 0, strategy="empty")
+            empty_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            return _pack_prediction([], empty_frame, 0, strategy="empty")
 
         # Nếu người dùng đang chủ động test ép nhãn trên giao diện Mock
         if self._fallback._forced_label is not None or self._fallback._forced_quality is not None:
-            return self._fallback.predict(frame, weight_gram)
+            return self._fallback.predict(frame, weight_gram, expected_classes=expected_classes)
 
         if not self.is_ready:
             if settings.mock_hardware:
-                res = self._fallback.predict(frame, weight_gram)
+                res = self._fallback.predict(frame, weight_gram, expected_classes=expected_classes)
                 res["strategy"] = "ncnn-fallback-mock"
                 return res
             # Trên phần cứng thật nhưng thiếu thư viện ncnn -> trả về cảnh báo rõ ràng lên UI
@@ -329,9 +546,16 @@ class NCNNYoloDetector(BaseAIDetector):
             logger.exception(f"[AI] Lỗi suy luận NCNN: {exc}")
             detections = []
 
-        annotated = draw_detections(frame, detections)
         elapsed_ms = max(1, int((time.perf_counter() - started) * 1000))
-        return _pack_prediction(detections, annotated, elapsed_ms, strategy=self.backend)
+        return _pack_prediction(
+            detections,
+            frame=frame,
+            inference_time_ms=elapsed_ms,
+            strategy=self.backend,
+            weight_gram=weight_gram,
+            expected_classes=expected_classes,
+            conf_threshold=self.conf_threshold,
+        )
 
     def _infer_cv_dnn(self, frame: np.ndarray) -> list[dict[str, Any]]:
         """Suy luận dự phòng qua cv2.dnn khi có file ONNX."""
@@ -422,14 +646,16 @@ class NCNNYoloDetector(BaseAIDetector):
         coords_max = float(np.max(out[:, :4])) if out.size else 0.0
         coord_mul = float(self.input_size) if 0.0 < coords_max <= 2.0 else 1.0
 
+        coarse_thresh = min(COARSE_CANDIDATE_THRESHOLD, float(self.conf_threshold))
         scores_matrix = out[:, 4:]
         best_cls_ids = np.argmax(scores_matrix, axis=1)
         best_confs = scores_matrix[np.arange(out.shape[0]), best_cls_ids]
-        valid_mask = best_confs >= self.conf_threshold
+        valid_mask = best_confs >= coarse_thresh
 
         boxes: list[list[int]] = []
         confidences: list[float] = []
         class_ids: list[int] = []
+        candidates_per_box: list[list[dict[str, Any]]] = []
 
         for row, cls_id, conf in zip(out[valid_mask], best_cls_ids[valid_mask], best_confs[valid_mask]):
             cx = float(row[0]) * coord_mul
@@ -460,14 +686,27 @@ class NCNNYoloDetector(BaseAIDetector):
             if box_w <= 2 or box_h <= 2:
                 continue
 
+            row_scores = row[4:]
+            top3_indices = np.argsort(row_scores)[::-1][:3]
+            cand_list = [
+                {
+                    "class_id": int(cid),
+                    "label": self.class_names.get(int(cid), f"class_{int(cid)}"),
+                    "confidence": round(float(row_scores[cid]), 3),
+                }
+                for cid in top3_indices
+                if float(row_scores[cid]) >= coarse_thresh
+            ]
+
             boxes.append([x1, y1, box_w, box_h])
             confidences.append(float(conf))
             class_ids.append(int(cls_id))
+            candidates_per_box.append(cand_list)
 
         if not boxes:
             return []
 
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_threshold, self.iou_threshold)
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, coarse_thresh, self.iou_threshold)
         if len(indices) == 0:
             return []
 
@@ -482,17 +721,18 @@ class NCNNYoloDetector(BaseAIDetector):
                     "label": self.class_names.get(cls_id, f"class_{cls_id}"),
                     "confidence": round(confidences[i], 3),
                     "box": {"x1": x1, "y1": y1, "x2": x1 + box_w, "y2": y1 + box_h},
+                    "top_candidates": candidates_per_box[i],
                 }
             )
 
-        detections.sort(key=lambda d: d["confidence"], reverse=True)
-        return detections[:8]
+        return _merge_overlapping_candidates(detections, iou_threshold=OVERLAP_IOU_THRESHOLD, min_score=coarse_thresh)
 
     def _infer_ultralytics(self, frame: np.ndarray) -> list[dict[str, Any]]:
+        coarse_thresh = min(COARSE_CANDIDATE_THRESHOLD, float(self.conf_threshold))
         results = self._yolo(
             frame,
             imgsz=self.input_size,
-            conf=self.conf_threshold,
+            conf=coarse_thresh,
             iou=self.iou_threshold,
             verbose=False,
         )
@@ -506,11 +746,12 @@ class NCNNYoloDetector(BaseAIDetector):
         for box in res.boxes:
             cls_id = int(box.cls[0].item())
             conf = float(box.conf[0].item())
+            label = self.class_names.get(cls_id, f"class_{cls_id}")
             xyxy = box.xyxy[0].cpu().numpy().astype(int)
             detections.append(
                 {
                     "class_id": cls_id,
-                    "label": self.class_names.get(cls_id, f"class_{cls_id}"),
+                    "label": label,
                     "confidence": round(conf, 3),
                     "box": {
                         "x1": int(xyxy[0]),
@@ -518,44 +759,120 @@ class NCNNYoloDetector(BaseAIDetector):
                         "x2": int(xyxy[2]),
                         "y2": int(xyxy[3]),
                     },
+                    "top_candidates": [{"class_id": cls_id, "label": label, "confidence": round(conf, 3)}],
                 }
             )
-        detections.sort(key=lambda d: d["confidence"], reverse=True)
-        return detections[:8]
+        return _merge_overlapping_candidates(detections, iou_threshold=OVERLAP_IOU_THRESHOLD, min_score=coarse_thresh)
 
 
 def _pack_prediction(
     detections: list[dict[str, Any]],
-    annotated: np.ndarray,
-    inference_time_ms: int,
-    strategy: str,
+    annotated: np.ndarray | None = None,
+    inference_time_ms: int = 0,
+    strategy: str = "ncnn",
+    frame: np.ndarray | None = None,
+    weight_gram: float = 0.0,
+    expected_classes: list[str] | None = None,
+    conf_threshold: float = 0.35,
 ) -> dict[str, Any]:
-    """Đóng gói kết quả suy luận chuẩn hóa cho Pipeline & WebSocket."""
+    """Áp dụng Context & Weight-Aware Reranking và đóng gói kết quả suy luận chuẩn hóa."""
+    raw_dets = list(detections or [])
     rotten_hits = [
-        d for d in detections
-        if evaluate_quality(d["label"], d["confidence"]) == QualityStatus.REJECTED.value
+        d for d in raw_dets
+        if evaluate_quality(d["label"], float(d["confidence"])) == QualityStatus.REJECTED.value
+        and float(d["confidence"]) >= conf_threshold
     ]
+
+    top_candidates: list[dict[str, Any]] = []
+    reranked = False
+    quality_note: str | None = None
+    final_detections: list[dict[str, Any]] = []
+
     if rotten_hits:
-        best = max(rotten_hits, key=lambda d: d["confidence"])
-    elif detections:
-        best = max(detections, key=lambda d: d["confidence"])
+        best = dict(max(rotten_hits, key=lambda d: float(d["confidence"])))
+        top_candidates = list(best.get("top_candidates") or [{"label": best["label"], "confidence": best["confidence"]}])
+        final_detections = [d for d in raw_dets if float(d.get("confidence", 0.0)) >= conf_threshold] or [best]
+        label = str(best["label"])
+        confidence = float(best["confidence"])
+        quality_status = evaluate_quality(label, confidence)
+    elif raw_dets:
+        ordered = sorted(raw_dets, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+        primary = dict(ordered[0])
+        primary_cands = list(
+            primary.get("top_candidates")
+            or [{"class_id": primary.get("class_id", -1), "label": primary["label"], "confidence": primary["confidence"]}]
+        )
+        rerank_out = _rerank_with_context_and_weight(
+            primary_cands,
+            weight_gram=weight_gram,
+            expected_classes=expected_classes,
+        )
+        selected = rerank_out["selected"]
+        top_candidates = rerank_out["candidates"]
+        reranked = bool(rerank_out["reranked"])
+
+        final_score = float(selected["reranked_score"])
+        raw_conf = float(selected["confidence"])
+        is_expected = bool(selected["is_expected"])
+
+        if final_score >= conf_threshold or raw_conf >= conf_threshold:
+            label = str(selected["label"])
+            confidence = round(min(0.99, max(raw_conf, final_score)), 3)
+            quality_status = evaluate_quality(label, confidence)
+            primary["label"] = label
+            primary["confidence"] = confidence
+            primary["raw_confidence"] = raw_conf
+            primary["class_id"] = selected.get("class_id", primary.get("class_id", -1))
+            primary["top_candidates"] = top_candidates
+            final_detections = [primary] + [
+                d for d in ordered[1:] if float(d.get("confidence", 0.0)) >= conf_threshold
+            ]
+            best = primary
+        elif 0.22 <= final_score < conf_threshold and is_expected:
+            label = str(selected["label"])
+            confidence = round(final_score, 3)
+            quality_status = QualityStatus.WARNING.value
+            quality_note = "Độ tự tin trung bình - Khớp phiếu yêu cầu"
+            primary["label"] = label
+            primary["confidence"] = confidence
+            primary["raw_confidence"] = raw_conf
+            primary["class_id"] = selected.get("class_id", primary.get("class_id", -1))
+            primary["top_candidates"] = top_candidates
+            final_detections = [primary] + [
+                d for d in ordered[1:] if float(d.get("confidence", 0.0)) >= conf_threshold
+            ]
+            best = primary
+        else:
+            best = {"label": "Unknown", "confidence": 0.0}
+            label = "Unknown"
+            confidence = 0.0
+            quality_status = QualityStatus.WARNING.value
+            final_detections = []
     else:
         best = {"label": "Unknown", "confidence": 0.0}
+        label = "Unknown"
+        confidence = 0.0
+        quality_status = QualityStatus.WARNING.value
+        final_detections = []
 
-    label = str(best["label"])
-    confidence = float(best["confidence"])
-    quality_status = evaluate_quality(label, confidence)
+    if annotated is None:
+        base_frame = frame if frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+        annotated = draw_detections(base_frame, final_detections)
+
     fps = round(1000.0 / inference_time_ms, 1) if inference_time_ms > 0 else 0.0
 
     return {
         "detected_class": label,
         "quality_status": quality_status,
+        "quality_note": quality_note,
         "confidence": round(confidence, 3),
         "confidence_percent": round(confidence * 100.0, 1),
         "bbox": best.get("box"),
         "inference_time_ms": inference_time_ms,
         "fps": fps,
-        "detections": detections,
+        "detections": final_detections,
+        "top_candidates": top_candidates,
+        "reranked": reranked,
         "annotated_frame": annotated,
         "strategy": strategy,
     }

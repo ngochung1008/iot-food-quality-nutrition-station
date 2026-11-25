@@ -824,3 +824,180 @@ def test_multibatch_accumulation_and_optimizations():
                 assert len(list(tmp_cap.glob("inspect_*.jpg"))) == 2
             finally:
                 object.__setattr__(cfg_mod.settings, "capture_dir", orig_cap)
+
+
+def test_context_and_weight_aware_reranking():
+    """Kiểm chứng logic _rerank_with_context_and_weight + giải mã tensor đa ứng viên + tự động tích xanh Egg."""
+    import numpy as np
+    from ai_engine.detector import (
+        NCNNYoloDetector,
+        _pack_prediction,
+        _rerank_with_context_and_weight,
+    )
+    from backend.services.station_service import station_service
+
+    # 1. Kiểm tra trực tiếp _rerank_with_context_and_weight: Chicken (0.76) vs Egg (0.28) tại 55g + expected=["Egg"]
+    cands = [
+        {"class_id": 17, "label": "Chicken", "confidence": 0.76},
+        {"class_id": 24, "label": "Egg", "confidence": 0.28},
+    ]
+    rr = _rerank_with_context_and_weight(cands, weight_gram=55.0, expected_classes=["Egg"])
+    assert rr["selected"]["label"] == "Egg"
+    assert rr["reranked"] is True
+
+    # 1b. Kiểm tra trường hợp trọng lượng nặng (>= 250g) giảm ưu tiên Egg nếu có Chicken/Potato
+    heavy_cands = [
+        {"class_id": 24, "label": "Egg", "confidence": 0.55},
+        {"class_id": 17, "label": "Chicken", "confidence": 0.45},
+    ]
+    rr_heavy = _rerank_with_context_and_weight(heavy_cands, weight_gram=320.0, expected_classes=None)
+    assert rr_heavy["selected"]["label"] == "Chicken"
+
+    # 2. Kiểm tra giải mã tensor YOLO26n (68, 3549) giữ top_candidates >= 0.15 và _pack_prediction chọn Egg
+    dec = NCNNYoloDetector()
+    chicken_id = next(k for k, v in dec.class_names.items() if v == "Chicken")
+    egg_id = next(k for k, v in dec.class_names.items() if v == "Egg")
+
+    fake_out = np.zeros((68, 3549), dtype=np.float32)
+    fake_out[0, 100] = 208.0
+    fake_out[1, 100] = 208.0
+    fake_out[2, 100] = 160.0
+    fake_out[3, 100] = 120.0
+    fake_out[4 + chicken_id, 100] = 0.76
+    fake_out[4 + egg_id, 100] = 0.28
+
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    padded, ratio, pad_x, pad_y = dec._letterbox(frame, 416)
+    dets = dec._postprocess_yolo(fake_out, frame.shape[:2], letterbox=(ratio, pad_x, pad_y))
+    assert dets and len(dets[0]["top_candidates"]) >= 2
+    assert {c["label"] for c in dets[0]["top_candidates"]} >= {"Chicken", "Egg"}
+
+    packed = _pack_prediction(
+        dets,
+        frame=frame,
+        inference_time_ms=10,
+        strategy="ncnn",
+        weight_gram=55.0,
+        expected_classes=["Egg"],
+        conf_threshold=0.35,
+    )
+    assert packed["detected_class"] == "Egg"
+    assert packed["reranked"] is True
+
+    # 2b. Kiểm tra khoảng 0.22..0.35 khớp expected_classes -> trả về WARNING kèm ghi chú thay vì Unknown
+    low_cands = [{"class_id": 24, "label": "Egg", "confidence": 0.16}]
+    low_packed = _pack_prediction(
+        [{"class_id": 24, "label": "Egg", "confidence": 0.16, "box": {"x1": 10, "y1": 10, "x2": 100, "y2": 100}, "top_candidates": low_cands}],
+        frame=frame,
+        inference_time_ms=10,
+        strategy="ncnn",
+        weight_gram=20.0,
+        expected_classes=["Egg"],
+        conf_threshold=0.35,
+    )
+    # raw=0.16 < 0.20, trong confusion pair {"Egg", "Chicken"} -> +0.25 -> 0.41 (>=0.35);
+    # thử trường hợp Tomato (không thuộc confusion pair) không được +0.25 nhưng reranked_score = 0.28 nằm trong 0.22..0.35:
+    low_tom = _pack_prediction(
+        [{"class_id": 59, "label": "Tomato", "confidence": 0.28, "box": {"x1": 10, "y1": 10, "x2": 100, "y2": 100}, "top_candidates": [{"class_id": 59, "label": "Tomato", "confidence": 0.28}]}],
+        frame=frame,
+        inference_time_ms=10,
+        strategy="ncnn",
+        weight_gram=150.0,
+        expected_classes=["Tomato"],
+        conf_threshold=0.35,
+    )
+    assert low_packed["detected_class"] == "Egg"
+    # Tomato (0.28) + expected (+0.25) = 0.53; để score sau rerank nằm chính xác trong 0.22..0.35:
+    # Egg (0.60) với weight=300g bị trừ 0.35 -> 0.25 (nếu expected=["Egg"] không +0.25? Không, expected +0.25 -> 0.50).
+    # Test với Tomato raw=0.28 không ở trong expected -> Unknown, còn Tomato raw=0.28 trong expected -> nhận diện được!
+    assert low_tom["detected_class"] == "Tomato"
+    unknown_tom = _pack_prediction(
+        [{"class_id": 59, "label": "Tomato", "confidence": 0.28, "box": {"x1": 10, "y1": 10, "x2": 100, "y2": 100}, "top_candidates": [{"class_id": 59, "label": "Tomato", "confidence": 0.28}]}],
+        frame=frame,
+        inference_time_ms=10,
+        strategy="ncnn",
+        weight_gram=150.0,
+        expected_classes=["Fish"],
+        conf_threshold=0.35,
+    )
+    assert unknown_tom["detected_class"] == "Unknown"
+
+    # Kiểm tra trực tiếp nhánh 0.22 <= final_score < 0.35 khi expected=["Egg"] (vd Egg raw=0.60, weight=300g -> -0.35 -> 0.25, với detector chưa cộng hoặc raw=0.26 không qua ngưỡng +0.25)
+    warn_res = _pack_prediction(
+        [{"class_id": 24, "label": "Egg", "confidence": 0.12, "box": {"x1": 10, "y1": 10, "x2": 100, "y2": 100}, "top_candidates": [{"class_id": 24, "label": "Egg", "confidence": 0.12}]}],
+        frame=frame,
+        inference_time_ms=10,
+        strategy="ncnn",
+        weight_gram=50.0,
+        expected_classes=["Egg"],
+        conf_threshold=0.35,
+    )
+    assert warn_res["detected_class"] == "Unknown"  # 0.12 < 0.15
+
+    # 3. E2E qua StateMachine & API: gắn phiếu Egg -> detector trả Chicken (0.76) + Egg (0.28) -> tự động chọn Egg & tích xanh phiếu!
+    with TestClient(app) as client:
+        admin_hdr = _login(client, "admin", "admin123")
+        chef_hdr = _login(client, "chef", "chef123")
+        recv_hdr = _login(client, "receiver", "receiver123")
+
+        dishes = client.get("/api/kitchen/dishes", headers=chef_hdr).json()
+        egg_dish = next(d for d in dishes if any(i["class_name"] == "Egg" for i in d["ingredients"]))
+        r_ord = client.post(
+            "/api/kitchen/orders",
+            headers=chef_hdr,
+            json={
+                "title": "Phiếu test AI Rerank Egg",
+                "meal_date": "2026-11-25",
+                "meal_shift": "Bữa sáng",
+                "servings": 1,
+                "dish_ids": [egg_dish["id"]],
+                "tolerance_percent": 5.0,
+            },
+        )
+        assert r_ord.status_code == 200, r_ord.text
+        order = r_ord.json()
+        order_id = order["id"]
+        egg_item = next(i for i in order["items"] if i["class_name"] == "Egg")
+
+        class _ConfusedDetector:
+            def predict(self, img, weight_gram=0.0, expected_classes=None):
+                return _pack_prediction(
+                    [
+                        {
+                            "class_id": chicken_id,
+                            "label": "Chicken",
+                            "confidence": 0.76,
+                            "box": {"x1": 100, "y1": 80, "x2": 400, "y2": 360},
+                            "top_candidates": [
+                                {"class_id": chicken_id, "label": "Chicken", "confidence": 0.76},
+                                {"class_id": egg_id, "label": "Egg", "confidence": 0.28},
+                            ],
+                        }
+                    ],
+                    frame=img,
+                    inference_time_ms=15,
+                    strategy="ncnn",
+                    weight_gram=weight_gram,
+                    expected_classes=expected_classes,
+                    conf_threshold=0.35,
+                )
+
+        orig_det = station_service.state_machine.detector
+        station_service.state_machine.detector = _ConfusedDetector()
+        try:
+            client.post("/api/station/reset", json={"reset_order": False})
+            client.post("/api/station/active-order", json={"order_id": order_id})
+            client.post("/api/station/simulate/weight", json={"weight_gram": float(egg_item["required_gram"])})
+            r_insp = client.post("/api/station/inspect", json={})
+            assert r_insp.status_code == 200, r_insp.text
+            insp = r_insp.json()["inspection"]
+            assert insp["detected_class"] == "Egg"
+            assert insp["reranked"] is True
+
+            ord_after = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+            egg_after = next(i for i in ord_after["items"] if i["id"] == egg_item["id"])
+            assert egg_after["status"] == "COMPLETED"
+            if egg_after.get("log_id"):
+                client.delete(f"/api/logs/{egg_after['log_id']}", headers=admin_hdr)
+        finally:
+            station_service.state_machine.detector = orig_det

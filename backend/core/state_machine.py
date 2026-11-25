@@ -255,6 +255,22 @@ class NutritionStationStateMachine:
         w = float(weight_gram if weight_gram is not None else self.scale.read_filtered_weight())
         frame = self.camera.get_frame()
 
+        with self._lock:
+            ctx_order_id = self.active_order_id
+        expected_classes: list[str] = []
+        if ctx_order_id:
+            from backend.database.crud import get_procurement_order
+
+            ctx_order = get_procurement_order(ctx_order_id)
+            if ctx_order and ctx_order.get("status") in {"PENDING", "IN_PROGRESS"}:
+                expected_classes = list(
+                    dict.fromkeys(
+                        it["class_name"]
+                        for it in ctx_order.get("items", [])
+                        if it.get("status") in {"PENDING", "PARTIAL"}
+                    )
+                )
+
         if frame is None:
             prediction = {
                 "detected_class": override_label or "Unknown",
@@ -263,11 +279,15 @@ class NutritionStationStateMachine:
                 "inference_time_ms": 0,
                 "fps": 0.0,
                 "detections": [],
+                "top_candidates": [],
                 "strategy": "no-frame",
             }
             image_url = None
         else:
-            prediction = self.detector.predict(frame, w)
+            try:
+                prediction = self.detector.predict(frame, w, expected_classes=expected_classes)
+            except TypeError:
+                prediction = self.detector.predict(frame, w)
             annotated = prediction.pop("annotated_frame", frame)
             self.camera.set_overlay_detections(prediction.get("detections", []))
             image_url = self.camera.save_capture(annotated, prefix="inspect")
@@ -286,6 +306,15 @@ class NutritionStationStateMachine:
             confidence=confidence,
             detections=prediction.get("detections", []),
         )
+        if prediction.get("quality_note"):
+            quality["badge_text"] = prediction["quality_note"]
+            quality["recommendation"] = (
+                f"{prediction['quality_note']} ({confidence * 100:.0f}%). "
+                "Vui lòng kiểm tra cảm quan trước khi chốt nhập."
+            )
+            quality["status"] = "WARNING"
+            quality["alert_level"] = "warning"
+            quality["is_acceptable"] = True
         if prediction.get("warning"):
             quality["badge_text"] = prediction["warning"]
             quality["recommendation"] = (
@@ -325,6 +354,8 @@ class NutritionStationStateMachine:
             "strategy": prediction.get("strategy", "ncnn"),
             "warning": prediction.get("warning"),
             "detections": prediction.get("detections", []),
+            "top_candidates": prediction.get("top_candidates", []),
+            "reranked": bool(prediction.get("reranked", False)),
             "image_url": image_url,
             "quality": quality,
             "nutrition": nutrition,
