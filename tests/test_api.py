@@ -1001,3 +1001,72 @@ def test_context_and_weight_aware_reranking():
                 client.delete(f"/api/logs/{egg_after['log_id']}", headers=admin_hdr)
         finally:
             station_service.state_machine.detector = orig_det
+
+
+def test_order_reset_does_not_accumulate_stale_logs_cost_or_kcal():
+    """Tạo phiếu -> cân -> reset phiếu -> cân lại 60.6g Egg -> xác nhận tổng tiền = 3.333đ & Calo = 88.5 kcal."""
+    with TestClient(app) as client:
+        admin_hdr = _login(client, "admin", "admin123")
+        chef_hdr = _login(client, "chef", "chef123")
+        recv_hdr = _login(client, "receiver", "receiver123")
+
+        r_dish = client.post(
+            "/api/kitchen/dishes",
+            headers=chef_hdr,
+            json={
+                "name_vi": "Trứng gà test reset (1 quả)",
+                "category": "Bữa sáng Demo",
+                "ingredients": [{"class_name": "Egg", "grams_per_serving": 50.0}],
+            },
+        )
+        assert r_dish.status_code == 200, r_dish.text
+        dish_id = r_dish.json()["id"]
+
+        r_ord = client.post(
+            "/api/kitchen/orders",
+            headers=chef_hdr,
+            json={
+                "title": "Phiếu test reset không cộng dồn log cũ",
+                "meal_date": "2026-11-25",
+                "meal_shift": "Ca Sáng",
+                "servings": 1,
+                "dish_ids": [dish_id],
+                "tolerance_percent": 5.0,
+            },
+        )
+        assert r_ord.status_code == 200, r_ord.text
+        order_id = r_ord.json()["id"]
+
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/active-order", json={"order_id": order_id})
+
+        # Lần cân 1 (55.0g) & Lần cân 2 (60.6g sau reset lần 1)
+        client.post("/api/station/simulate/weight", json={"weight_gram": 55.0})
+        client.post("/api/station/inspect", json={"override_label": "Egg", "override_quality": "FRESH"})
+        ord1 = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        log1_id = ord1["items"][0]["log_id"]
+
+        # Reset phiếu -> log1 phải bị gỡ order_id/order_item_id và summary về 0
+        r_rst = client.post(f"/api/kitchen/orders/{order_id}/reset", headers=recv_hdr)
+        assert r_rst.status_code == 200
+        rst_ord = r_rst.json()["order"]
+        assert rst_ord["actual_summary"]["total_gram"] == 0.0
+        assert rst_ord["actual_summary"]["total_cost_vnd"] == 0
+        assert rst_ord["actual_summary"]["total_kcal"] == 0.0
+
+        # Cân lại 60.6g Egg (55.000 đ/kg) -> tổng tiền phải đúng 3.333 đ, Calo đúng 88.5 kcal (không cộng dồn lần 1)
+        client.post("/api/station/simulate/weight", json={"weight_gram": 60.6})
+        client.post("/api/station/inspect", json={"override_label": "Egg", "override_quality": "FRESH"})
+        ord2 = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        log2_id = ord2["items"][0]["log_id"]
+        assert ord2["status"] == "COMPLETED"
+        assert ord2["actual_summary"]["total_gram"] == 60.6
+        assert ord2["actual_summary"]["total_cost_vnd"] == 3333
+        assert ord2["actual_summary"]["total_kcal"] == 88.5
+
+        # Dọn dẹp
+        if log1_id:
+            client.delete(f"/api/logs/{log1_id}", headers=admin_hdr)
+        if log2_id:
+            client.delete(f"/api/logs/{log2_id}", headers=admin_hdr)
+        client.delete(f"/api/kitchen/dishes/{dish_id}", headers=chef_hdr)

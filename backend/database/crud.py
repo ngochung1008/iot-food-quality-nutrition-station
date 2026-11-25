@@ -716,16 +716,10 @@ def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
             (order_row["id"],),
         ).fetchall()
     ]
-    log_rows = conn.execute(
-        "SELECT id, order_item_id, weight_gram, energy_kcal, total_price_vnd FROM intake_logs WHERE order_id = ?",
-        (order_row["id"],),
+    food_rows = conn.execute(
+        "SELECT class_name, edible_portion_percent, energy_kcal, unit_price_vnd_per_kg FROM foods_nutrition"
     ).fetchall()
-    log_map = {r["id"]: dict(r) for r in log_rows}
-    logs_by_item: dict[str, list[dict[str, Any]]] = {}
-    for r in log_rows:
-        item_key = r["order_item_id"] or ""
-        if item_key:
-            logs_by_item.setdefault(item_key, []).append(dict(r))
+    food_nut_map = {str(r["class_name"]).lower(): dict(r) for r in food_rows}
 
     total_items = len(items)
     completed_items = sum(1 for it in items if it["status"] == "COMPLETED")
@@ -737,18 +731,23 @@ def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
         if it["status"] not in {"COMPLETED", "PARTIAL"}:
             continue
         gram = float(it.get("actual_gram") or 0.0)
+        if gram <= 0:
+            continue
         actual_total_gram += gram
-        item_logs = logs_by_item.get(it["id"], [])
-        if item_logs:
-            actual_total_cost_vnd += sum(int(l.get("total_price_vnd") or 0) for l in item_logs)
-            actual_total_kcal += sum(float(l.get("energy_kcal") or 0.0) for l in item_logs)
-        else:
-            log_doc = log_map.get(it.get("log_id") or "")
-            if log_doc:
-                actual_total_cost_vnd += int(log_doc.get("total_price_vnd") or 0)
-                actual_total_kcal += float(log_doc.get("energy_kcal") or 0.0)
-            else:
-                actual_total_cost_vnd += int(round((gram / 1000.0) * int(it.get("unit_price_per_kg") or 40000)))
+        fn = food_nut_map.get(str(it.get("class_name") or "").lower())
+        unit_price = int(it.get("unit_price_per_kg") or (fn["unit_price_vnd_per_kg"] if fn else 40000))
+        item_cost = int(round((gram / 1000.0) * unit_price))
+        actual_total_cost_vnd += item_cost
+
+        item_kcal = 0.0
+        if fn:
+            edible_pct = float(fn.get("edible_portion_percent") or 100.0)
+            factor = (gram * (edible_pct / 100.0)) / 100.0
+            item_kcal = round(float(fn.get("energy_kcal") or 0.0) * factor, 1)
+            actual_total_kcal += item_kcal
+
+        it["actual_cost_vnd"] = item_cost
+        it["actual_kcal"] = item_kcal
 
     return {
         "id": order_row["id"],
@@ -993,6 +992,10 @@ def reset_procurement_order(order_id: str) -> dict[str, Any] | None:
         if not order_row:
             return None
 
+        conn.execute(
+            "UPDATE intake_logs SET order_id = NULL, order_item_id = NULL WHERE order_id = ?",
+            (order_id,),
+        )
         conn.execute(
             """
             UPDATE procurement_items
