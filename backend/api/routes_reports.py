@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 
-from backend.core.security import ROLE_ADMIN, require_roles
+from backend.core.security import require_admin
 
 from backend.database.crud import (
     delete_intake_log,
@@ -34,7 +34,7 @@ def get_intake_logs(
     )
 
 
-@router.delete("/logs/{log_id}", dependencies=[Depends(require_roles(ROLE_ADMIN))])
+@router.delete("/logs/{log_id}", dependencies=[Depends(require_admin)])
 def remove_intake_log(log_id: str):
     """Xóa một phiếu nhập kho theo ID."""
     ok = delete_intake_log(log_id)

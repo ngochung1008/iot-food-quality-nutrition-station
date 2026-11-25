@@ -374,26 +374,56 @@ export class LiveStationPage {
     tbody.innerHTML = order.items
       .map((it) => {
         const done = it.status === "COMPLETED";
+        const partial = it.status === "PARTIAL";
         const classMatch = detectedClass && detectedClass.toLowerCase() === it.class_name.toLowerCase();
-        const rowCls = done ? "row-completed" : classMatch ? "row-matched" : "";
-        const minG = Number(it.min_acceptable_gram || it.required_gram * 0.95);
+        const rowCls = done ? "row-completed" : partial ? "row-partial" : classMatch ? "row-matched" : "";
+        const reqG = Number(it.required_gram || 0);
+        const minG = Number(it.min_acceptable_gram || reqG * 0.95);
+        const savedActual = Number(it.actual_gram || 0);
+        const previewActual =
+          done
+            ? savedActual
+            : partial
+            ? savedActual + (classMatch && !insp?.committed ? currentWeight : 0)
+            : classMatch
+            ? currentWeight
+            : 0;
+        const pct = reqG > 0 ? Math.min(100, Math.round((savedActual / reqG) * 100)) : 0;
+        const remainG = Math.max(0, reqG - savedActual);
 
-        const checkCell = `<span class="check-circle ${done ? "done" : ""}" aria-label="${done ? "Hoàn thành" : "Chờ cân"}"></span>`;
+        const checkCell = `<span class="check-circle ${done ? "done" : partial ? "partial" : ""}" aria-label="${
+          done ? "Hoàn thành" : partial ? "Đang nhận dở" : "Chờ cân"
+        }"></span>`;
         const unitPriceStr = Number(it.unit_price_per_kg || 40000).toLocaleString("vi-VN");
         const actualStr = done
-          ? `<strong class="tabular-nums" style="color:var(--brand);">${Number(it.actual_gram).toFixed(1)} g</strong>`
+          ? `<strong class="tabular-nums" style="color:var(--brand);">${savedActual.toFixed(1)} g</strong>
+             <div class="item-progress-mini"><div class="item-progress-fill is-done" style="width:100%;"></div></div>
+             <div style="font-size:12px; color:var(--brand); font-weight:700; margin-top:2px;">Đủ định lượng</div>`
+          : partial
+          ? `<strong class="tabular-nums" style="color:var(--info);">${savedActual.toFixed(1)} / ${reqG.toFixed(0)} g</strong>
+             <div class="item-progress-mini"><div class="item-progress-fill" style="width:${pct}%;"></div></div>
+             <div style="font-size:12px; color:var(--accent); font-weight:600; margin-top:2px;">Còn thiếu ${remainG.toFixed(1)}g${
+               classMatch && !insp?.committed && currentWeight > 0 ? ` (+${currentWeight.toFixed(1)}g)` : ""
+             }</div>`
           : classMatch
-          ? `<span class="tabular-nums" style="font-weight:700; color:${currentWeight >= minG ? "var(--brand)" : "var(--accent)"};">${currentWeight.toFixed(1)} g</span>`
-          : `<span style="color:var(--text-muted);">Chờ cân</span>`;
+          ? `<span class="tabular-nums" style="font-weight:700; color:${previewActual >= minG ? "var(--brand)" : "var(--accent)"};">${currentWeight.toFixed(1)} g</span>
+             <div class="item-progress-mini"><div class="item-progress-fill" style="width:${
+               reqG > 0 ? Math.min(100, Math.round((currentWeight / reqG) * 100)) : 0
+             }%;"></div></div>`
+          : `<span style="color:var(--text-muted);">Chờ cân</span>
+             <div class="item-progress-mini"><div class="item-progress-fill" style="width:0%;"></div></div>`;
 
         return `
           <tr class="${rowCls}" data-item-id="${it.id}">
             <td>${checkCell}</td>
             <td>
-              <div style="font-weight:700; color:var(--text-primary);">${it.food_name_vi}</div>
-              <div style="font-size:14px; color:var(--text-muted);">${it.class_name} (tối thiểu ${minG.toFixed(0)}g)</div>
+              <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                <span style="font-weight:700; color:var(--text-primary);">${it.food_name_vi}</span>
+                ${partial ? `<span class="badge badge-info" style="padding:2px 8px; font-size:12px;">Đang cộng dồn</span>` : ""}
+              </div>
+              <div style="font-size:13px; color:var(--text-muted);">${it.class_name} (tối thiểu ${minG.toFixed(0)}g)</div>
             </td>
-            <td class="tabular-nums" style="font-weight:700;">${Number(it.required_gram).toLocaleString("vi-VN")} g</td>
+            <td class="tabular-nums" style="font-weight:700;">${reqG.toLocaleString("vi-VN")} g</td>
             <td class="tabular-nums">${unitPriceStr} đ/kg</td>
             <td>${actualStr}</td>
           </tr>
@@ -434,16 +464,27 @@ export class LiveStationPage {
     }
 
     const cls = (insp.food_name_en || insp.detected_class || "").toLowerCase();
+    const partialMatch = order.items.find((it) => it.status === "PARTIAL" && it.class_name.toLowerCase() === cls);
     const pendingMatch = order.items.find((it) => it.status === "PENDING" && it.class_name.toLowerCase() === cls);
     const completedMatch = order.items.find((it) => it.status === "COMPLETED" && it.class_name.toLowerCase() === cls);
 
     if (insp.committed && completedMatch) {
       playSuccessBeep();
-      this.toast(`Đã đối chiếu và tích xanh: ${completedMatch.food_name_vi}`, "success");
+      this.toast(`Đã đối chiếu đủ và tích xanh: ${completedMatch.food_name_vi}`, "success");
       return;
     }
 
-    if (!pendingMatch && !completedMatch && cls && cls !== "unknown") {
+    if (insp.committed && partialMatch) {
+      playSuccessBeep();
+      const remain = Math.max(0, Number(partialMatch.required_gram) - Number(partialMatch.actual_gram || 0));
+      this.toast(
+        `Đã cộng dồn ${partialMatch.food_name_vi}: ${Number(partialMatch.actual_gram).toFixed(1)} / ${Number(partialMatch.required_gram).toFixed(0)}g (còn thiếu ${remain.toFixed(1)}g).`,
+        "info"
+      );
+      return;
+    }
+
+    if (!pendingMatch && !partialMatch && !completedMatch && cls && cls !== "unknown") {
       this.toast(
         `Thực phẩm "${insp.food_name_vi || insp.detected_class}" không nằm trong danh sách cần nhập của phiếu hiện tại.`,
         "warning"
@@ -451,14 +492,12 @@ export class LiveStationPage {
       return;
     }
 
-    if (pendingMatch) {
+    const activeMatch = partialMatch || pendingMatch;
+    if (activeMatch) {
       const w = Number(insp.weight_g ?? insp.weight_gram ?? 0);
-      const minG = Number(pendingMatch.min_acceptable_gram || pendingMatch.required_gram * 0.95);
+      const minG = Number(activeMatch.min_acceptable_gram || activeMatch.required_gram * 0.95);
       if (w < minG) {
-        this.toast(
-          `${pendingMatch.food_name_vi} chưa đủ khối lượng yêu cầu (${w.toFixed(1)}g / tối thiểu ${minG.toFixed(0)}g).`,
-          "warning"
-        );
+        playSuccessBeep();
       } else {
         playSuccessBeep();
       }
@@ -603,7 +642,7 @@ export class LiveStationPage {
       if (promptBox) promptBox.style.display = "none";
     });
 
-    document.getElementById("btn-inspect-now")?.addEventListener("click", async () => {
+    const triggerRescan = async () => {
       try {
         const res = await apiClient.inspectNow();
         if (res.snapshot) {
@@ -613,7 +652,10 @@ export class LiveStationPage {
       } catch (e) {
         this.toast(`Lỗi nhận diện AI: ${e.message}`, "error");
       }
-    });
+    };
+
+    document.getElementById("btn-inspect-now")?.addEventListener("click", triggerRescan);
+    document.getElementById("btn-rescan")?.addEventListener("click", triggerRescan);
 
     document.getElementById("btn-manual-confirm")?.addEventListener("click", async () => {
       try {
@@ -627,7 +669,7 @@ export class LiveStationPage {
         ).toLowerCase();
 
         const pendingMatch = order?.items.find(
-          (it) => it.status === "PENDING" && it.class_name.toLowerCase() === targetClass
+          (it) => (it.status === "PENDING" || it.status === "PARTIAL") && it.class_name.toLowerCase() === targetClass
         );
 
         if (order && pendingMatch) {

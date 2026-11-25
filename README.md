@@ -41,10 +41,14 @@ python tests/test_ai.py
 pytest tests/test_api.py -v
 ```
 
-### Bước 3: Khởi động Backend + Web Dashboard
+### Bước 3: Khởi động nhanh từ thư mục gốc
 ```powershell
-python -m backend.main
+python main.py
 ```
+*(Hoặc chạy module trực tiếp: `python -m backend.main`)*
+
+Terminal sẽ tự động hiển thị địa chỉ truy cập Local (`http://127.0.0.1:8000`), địa chỉ mạng LAN (`http://<LAN_IP>:8000`) cho điện thoại/tablet và API Docs (`http://127.0.0.1:8000/docs`).
+
 Mở trình duyệt truy cập: **http://127.0.0.1:8000**
 - Trên giao diện **Trạm Vận Hành Chính**, sử dụng thanh **Chế độ Giả Lập** màu vàng phía trên để thử đặt cân (`350g`, `850g`, `1500g`), đổi loại thực phẩm (`Thịt bò`, `Thịt lợn`, `Cá`, `Cà chua`...) và giả lập trạng thái **TƯƠI / HỎNG**.
 - Chuyển sang tab **Phần Cứng & Hiệu Chuẩn** để xem sơ đồ kết nối Raspberry Pi 4 trực quan, nội dung LCD 16×2 mô phỏng và thử Wizard hiệu chuẩn cân.
@@ -86,8 +90,12 @@ python3 tests/test_ai.py
 python3 scripts/calibrate_cli.py
 ```
 
-### Bước 4: Khởi chạy dịch vụ nền & Kiosk tự động
+### Bước 4: Khởi chạy nhanh hoặc cài dịch vụ nền Systemd
 ```bash
+# Chạy trực tiếp từ thư mục gốc (tự hiển thị IP LAN truy cập trên điện thoại/tablet):
+python3 main.py
+
+# Hoặc cài dịch vụ nền & Kiosk tự động:
 sudo cp scripts/smart-scale.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable smart-scale.service

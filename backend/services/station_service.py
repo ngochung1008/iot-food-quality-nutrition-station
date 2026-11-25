@@ -110,11 +110,37 @@ class StationService:
         self.detector = None
         self.state_machine: NutritionStationStateMachine | None = None
 
+    def _cleanup_old_captures(self, max_files: int = 300) -> int:
+        """Giữ lại tối đa max_files ảnh inspect_*.jpg mới nhất trong captures/, xóa các ảnh cũ hơn."""
+        try:
+            capture_dir = settings.capture_dir
+            if not capture_dir.exists():
+                return 0
+            files = sorted(
+                capture_dir.glob("inspect_*.jpg"),
+                key=lambda p: (p.stat().st_mtime, p.name),
+                reverse=True,
+            )
+            removed = 0
+            for old_file in files[max(0, int(max_files)):]:
+                try:
+                    old_file.unlink(missing_ok=True)
+                    removed += 1
+                except Exception:
+                    pass
+            if removed:
+                logger.info(f"[STATION] Đã dọn dẹp {removed} ảnh kiểm định cũ (giữ {max_files} ảnh mới nhất).")
+            return removed
+        except Exception as exc:
+            logger.debug(f"[STATION] Lỗi dọn dẹp captures/: {exc}")
+            return 0
+
     def start(self) -> None:
         """Khởi tạo DB, phần cứng, AI và chạy vòng lặp giám sát 10Hz."""
         if self._started:
             return
         init_database()
+        self._cleanup_old_captures(max_files=300)
 
         self.scale = LoadcellManager()
         self.camera = CameraManager()
@@ -168,7 +194,7 @@ class StationService:
                     self.state_machine.update()
                     self.ws_hub.broadcast_sync({
                         "event": "telemetry",
-                        "data": self.state_machine.snapshot(),
+                        "data": self.state_machine.telemetry_snapshot(),
                     })
             except Exception as exc:
                 logger.exception(f"[STATION] Lỗi trong vòng lặp điều phối: {exc}")
@@ -236,6 +262,7 @@ class StationService:
         order_id: str | None = None,
         order_item_id: str | None = None,
         accumulate: bool = False,
+        allow_partial: bool = False,
     ) -> dict[str, Any]:
         """Chốt đơn / Lưu phiếu tiếp nhận vào SQLite (hỗ trợ đối chiếu Phiếu Yêu Cầu Nguyên Liệu)."""
         assert self.state_machine and self.scale
@@ -279,9 +306,16 @@ class StationService:
                 )
             if quality_st == "REJECTED":
                 raise ValueError("Thực phẩm bị đánh giá HƯ HỎNG (REJECTED), không thể tích xanh nhập kho.")
-            if weight_g < float(target_item["min_acceptable_gram"]):
+            cur_status = str(target_item.get("status") or "PENDING").upper()
+            existing_actual = (
+                float(target_item.get("actual_gram") or 0.0)
+                if (cur_status == "PARTIAL" or (accumulate and cur_status == "COMPLETED"))
+                else 0.0
+            )
+            projected_gram = existing_actual + weight_g
+            if not allow_partial and projected_gram < float(target_item["min_acceptable_gram"]):
                 raise ValueError(
-                    f"Khối lượng chưa đạt tối thiểu 95%: hiện có {weight_g:.1f}g "
+                    f"Khối lượng chưa đạt tối thiểu 95%: hiện có {projected_gram:.1f}g "
                     f"(yêu cầu tối thiểu {target_item['min_acceptable_gram']:.1f}g / {target_item['required_gram']:.1f}g)."
                 )
 
@@ -333,6 +367,7 @@ class StationService:
                 log_id=receipt["id"],
                 image_url=insp.get("image_url"),
                 accumulate=accumulate,
+                allow_partial=allow_partial,
             )
             self._on_station_event("order_updated", {"order": updated_order})
 

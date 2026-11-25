@@ -1,7 +1,7 @@
 /**
  * Tạo âm thanh cảnh báo bằng Web Audio API (không cần tải file MP3 ngoài).
- * - playSuccessBeep(): 2 nốt nhẹ khi thực phẩm đạt chuẩn hoặc lưu phiếu thành công.
- * - playRejectAlarm(): âm báo khẩn khi phát hiện thực phẩm hư hỏng (REJECTED).
+ * - playSuccessBeep(): 1 tiếng bíp nhẹ khi cộng dồn / tích xanh thành công.
+ * - playRejectAlarm(): 2 tiếng bíp trầm khi phát hiện thực phẩm hư hỏng (REJECTED).
  */
 let audioCtx = null;
 
@@ -33,12 +33,10 @@ function tone(freq, durationMs, delayMs = 0, type = "sine", gainVal = 0.12) {
 }
 
 export function playSuccessBeep() {
-  tone(880, 110, 0, "sine", 0.1);
-  tone(1174, 150, 120, "sine", 0.1);
+  tone(980, 115, 0, "sine", 0.11);
 }
 
 export function playRejectAlarm() {
-  tone(420, 180, 0, "sawtooth", 0.14);
-  tone(330, 220, 200, "sawtooth", 0.14);
-  tone(420, 220, 440, "sawtooth", 0.14);
+  tone(300, 170, 0, "sawtooth", 0.14);
+  tone(260, 210, 210, "sawtooth", 0.14);
 }

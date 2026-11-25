@@ -114,12 +114,15 @@ async def video_feed(request: Request):
     """Luồng video MJPEG trực tiếp kèm overlay bounding box từ CameraManager."""
 
     async def frame_generator():
+        cam = station_service.camera
+        if cam:
+            cam.acquire_stream()
         try:
             while True:
                 if SHUTDOWN_EVENT.is_set() or await request.is_disconnected():
                     break
-                if station_service.camera:
-                    chunk = station_service.camera.mjpeg_bytes()
+                if cam:
+                    chunk = cam.mjpeg_bytes()
                     if chunk:
                         yield (
                             b"--frame\r\n"
@@ -128,6 +131,9 @@ async def video_feed(request: Request):
                 await asyncio.sleep(0.04)
         except (asyncio.CancelledError, GeneratorExit):
             return
+        finally:
+            if cam:
+                cam.release_stream()
 
     return StreamingResponse(
         frame_generator(),

@@ -24,6 +24,7 @@ venv/
 *.bak
 *.tmp
 *.log
+*.zip
 logs/
 
 # Cơ sở dữ liệu & ảnh chụp vận hành thực tế

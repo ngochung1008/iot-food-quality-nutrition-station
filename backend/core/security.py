@@ -116,6 +116,9 @@ def require_roles(*allowed_roles: str) -> Callable[[dict[str, Any]], dict[str, A
     return _checker
 
 
+require_admin = require_roles(ROLE_ADMIN)
+
+
 def verify_admin_pin(x_admin_pin: str | None = Header(default=None, alias="X-Admin-Pin")) -> bool:
     """Kiểm tra mã PIN bổ sung nếu cấu hình ADMIN_PIN."""
     expected = settings.admin_pin

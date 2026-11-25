@@ -63,6 +63,8 @@ class CameraManager:
         self._consecutive_errors: int = 0
         self._reconnect_attempts: int = 0
         self._last_reconnect_time: float = 0.0
+        self._stream_clients: int = 0
+        self._force_encode_until: float = 0.0
 
         self._mock_cam = MockCameraGenerator(width=self.width, height=self.height)
 
@@ -180,6 +182,24 @@ class CameraManager:
         """Cập nhật khung hình giả lập theo loại thực phẩm và khối lượng."""
         self._mock_cam.set_scene(food_label=food_label, weight_g=weight_g, is_rotten=is_rotten)
 
+    @property
+    def active_stream_clients(self) -> int:
+        with self._lock:
+            return int(getattr(self, "_stream_clients", 0))
+
+    def acquire_stream(self) -> int:
+        """Đánh dấu có thêm client đang xem luồng /video_feed để bật nén JPEG."""
+        with self._lock:
+            self._stream_clients = int(getattr(self, "_stream_clients", 0)) + 1
+            self._force_encode_until = time.time() + 1.0
+            return self._stream_clients
+
+    def release_stream(self) -> int:
+        """Giảm số lượng client xem /video_feed khi ngắt kết nối."""
+        with self._lock:
+            self._stream_clients = max(0, int(getattr(self, "_stream_clients", 0)) - 1)
+            return self._stream_clients
+
     def set_overlay_detections(self, detections: list[dict[str, Any]]) -> None:
         """Cập nhật bounding box hiển thị lên luồng video trực tiếp."""
         with self._lock:
@@ -229,9 +249,18 @@ class CameraManager:
                         continue
                 raw_frame = self._standby_frame("KHONG TIM THAY CAMERA USB (/dev/video0)")
 
-            display_frame = self._draw_overlay(raw_frame)
-            ok_enc, buf = cv2.imencode(".jpg", display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            jpeg_bytes = buf.tobytes() if ok_enc else None
+            with self._lock:
+                need_encode = (
+                    int(getattr(self, "_stream_clients", 0)) > 0
+                    or time.time() < float(getattr(self, "_force_encode_until", 0.0))
+                )
+
+            if need_encode:
+                display_frame = self._draw_overlay(raw_frame)
+                ok_enc, buf = cv2.imencode(".jpg", display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                jpeg_bytes = buf.tobytes() if ok_enc else None
+            else:
+                jpeg_bytes = None
 
             with self._lock:
                 self._raw_frame = raw_frame

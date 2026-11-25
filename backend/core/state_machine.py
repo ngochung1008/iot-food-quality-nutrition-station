@@ -53,7 +53,7 @@ class NutritionStationStateMachine:
             logger.debug(f"[STATE] Lỗi emit {event_type}: {exc}")
 
     def snapshot(self) -> dict[str, Any]:
-        """Ảnh chụp trạng thái hiện tại để đẩy qua WebSocket hoặc GET /api/station/state."""
+        """Ảnh chụp trạng thái đầy đủ để đẩy khi kết nối/đổi trạng thái hoặc GET /api/station/state."""
         with self._lock:
             weight_g = round(abs(float(self.scale.current_weight)), 1)
             return {
@@ -70,6 +70,24 @@ class NutritionStationStateMachine:
                 "current_inspection": self.current_inspection,
                 "latest_inspection": self.current_inspection,
                 "last_committed_receipt": self.last_committed_receipt,
+                "ts": time.time(),
+            }
+
+    def telemetry_snapshot(self) -> dict[str, Any]:
+        """Gói telemetry gọn nhẹ ở tần số 10Hz qua WebSocket (không gửi kèm inspection/bbox nặng)."""
+        with self._lock:
+            weight_g = round(abs(float(self.scale.current_weight)), 1)
+            return {
+                "station_id": settings.station_id,
+                "station_name": settings.station_name,
+                "mock_hardware": settings.mock_hardware,
+                "state": self.state.value,
+                "weight_gram": weight_g,
+                "is_stable": bool(self.scale.is_stable),
+                "scale_online": bool(self.scale.scale_online),
+                "scale_calibrated": bool(self.scale.calibrated),
+                "auto_commit": self.auto_commit,
+                "active_order_id": self.active_order_id,
                 "ts": time.time(),
             }
 
@@ -253,6 +271,10 @@ class NutritionStationStateMachine:
             annotated = prediction.pop("annotated_frame", frame)
             self.camera.set_overlay_detections(prediction.get("detections", []))
             image_url = self.camera.save_capture(annotated, prefix="inspect")
+            if image_url:
+                from backend.services.station_service import station_service
+
+                station_service._cleanup_old_captures(max_files=300)
 
         detected_class = override_label or prediction.get("detected_class", "Unknown")
         confidence = float(prediction.get("confidence", 0.0))
@@ -331,7 +353,7 @@ class NutritionStationStateMachine:
             self._last_lcd_weight = w
             self._last_lcd_update_ts = time.time()
 
-        # Tự động đối chiếu & TÍCH XANH vào Phiếu Yêu Cầu Nguyên Liệu (chỉ ghi 1 lần/phiên cho tới khi về IDLE)
+        # Tự động đối chiếu & cộng dồn nhiều mẻ / TÍCH XANH vào Phiếu Yêu Cầu Nguyên Liệu (chỉ ghi 1 lần/phiên cho tới khi về IDLE)
         auto_checked = False
         allow_auto_record = (not already_committed_in_session) or (override_label is not None and weight_gram is None)
         if allow_auto_record and target_order_id and w >= settings.detect_weight_g and quality.get("status") != "REJECTED":
@@ -345,8 +367,11 @@ class NutritionStationStateMachine:
                         it
                         for it in order["items"]
                         if it["status"] != "COMPLETED"
+                        and (
+                            it["status"] in {"PENDING", "PARTIAL"}
+                            or float(it.get("actual_gram") or 0.0) < float(it.get("min_acceptable_gram") or 0.0)
+                        )
                         and it["class_name"].lower() == nutrition["class_name"].lower()
-                        and w >= float(it["min_acceptable_gram"])
                     ),
                     None,
                 )
@@ -355,15 +380,16 @@ class NutritionStationStateMachine:
                         station_service.commit_current_inspection(
                             order_id=target_order_id,
                             order_item_id=matched_item["id"],
-                            confirmed_by="Trạm cân AI (Tự động tích xanh)",
-                            note="Tự động đối chiếu đạt chuẩn >= 95%",
-                            accumulate=False,
+                            confirmed_by="Trạm cân AI (Tự động đối chiếu)",
+                            note="Tự động đối chiếu & cộng dồn tại trạm",
+                            accumulate=True,
+                            allow_partial=True,
                         )
                         auto_checked = True
                         with self._lock:
                             self._session_committed = True
                     except Exception as exc:
-                        logger.warning(f"[STATE] Auto tích xanh bỏ qua: {exc}")
+                        logger.warning(f"[STATE] Auto đối chiếu bỏ qua: {exc}")
 
         if allow_auto_record and not auto_checked and self.auto_commit and w >= settings.idle_weight_g:
             from backend.services.station_service import station_service
@@ -371,9 +397,6 @@ class NutritionStationStateMachine:
             station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định", accumulate=False)
             with self._lock:
                 self._session_committed = True
-            from backend.services.station_service import station_service
-
-            station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định")
 
         self._emit("inspection_result", self.snapshot())
         return inspection_result

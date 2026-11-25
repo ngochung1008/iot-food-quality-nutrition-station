@@ -172,11 +172,13 @@ async function enterAuthenticatedShell() {
       }
       if (msg.event === "receipt_committed") {
         latestSnapshot = msg.data.snapshot;
+      } else if (msg.event === "telemetry") {
+        latestSnapshot = { ...(latestSnapshot || {}), ...msg.data };
       } else {
         latestSnapshot = msg.data;
       }
       updateTopBadges(latestSnapshot);
-      pages[activePageKey]?.update?.(latestSnapshot);
+      pages[activePageKey]?.update?.(latestSnapshot, msg.event === "telemetry");
     },
     (connected) => {
       const wsPill = document.getElementById("ws-status-pill");

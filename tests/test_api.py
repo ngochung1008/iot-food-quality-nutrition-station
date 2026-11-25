@@ -725,3 +725,102 @@ def _run_e2e_test_body():
         client.delete(f"/api/logs/{extra_log_id}", headers=admin_hdr)
         client.delete(f"/api/logs/{carrot_log_id}", headers=admin_hdr)
         client.delete(f"/api/kitchen/dishes/{dish_id}", headers=chef_hdr)
+
+
+def test_multibatch_accumulation_and_optimizations():
+    """Kiểm tra cân cộng dồn nhiều mẻ (PARTIAL -> COMPLETED), đồng bộ xóa log, dọn captures và JPEG stream gating."""
+    import tempfile
+    from backend.core import config as cfg_mod
+    from backend.database.crud import get_summary_kpis, local_today_str
+    from backend.services.station_service import station_service
+    from hardware.camera import CameraManager
+
+    with TestClient(app) as client:
+        admin_hdr = _login(client, "admin", "admin123")
+        chef_hdr = _login(client, "chef", "chef123")
+        recv_hdr = _login(client, "receiver", "receiver123")
+
+        # 1. Kiểm tra JPEG stream gating trên CameraManager
+        cam = CameraManager()
+        assert cam.active_stream_clients >= 0
+        before_clients = cam.active_stream_clients
+        cam.acquire_stream()
+        assert cam.active_stream_clients == before_clients + 1
+        cam.release_stream()
+        assert cam.active_stream_clients == before_clients
+
+        # 2. Kiểm tra telemetry_snapshot gọn nhẹ không mang payload inspection nặng
+        tel = station_service.state_machine.telemetry_snapshot()
+        assert "weight_gram" in tel and "state" in tel
+        assert "current_inspection" not in tel
+
+        # 3. Tạo phiếu mới với nguyên liệu Fish 1000g (min_acceptable = 950g) để test cộng dồn 2 rổ (400g + 600g)
+        dishes = client.get("/api/kitchen/dishes", headers=chef_hdr).json()
+        fish_dish = next(d for d in dishes if any(i["class_name"] == "Fish" for i in d["ingredients"]))
+        r_order = client.post(
+            "/api/kitchen/orders",
+            headers=chef_hdr,
+            json={
+                "title": "Phiếu test cộng dồn nhiều mẻ",
+                "meal_date": local_today_str(),
+                "meal_shift": "Bữa trưa",
+                "servings": 10,
+                "dish_ids": [fish_dish["id"]],
+                "tolerance_percent": 5.0,
+            },
+        )
+        assert r_order.status_code == 200, r_order.text
+        order = r_order.json()
+        order_id = order["id"]
+        fish_item = next(i for i in order["items"] if i["class_name"] == "Fish")
+        req_g = float(fish_item["required_gram"])
+        batch1_g = round(req_g * 0.4, 1)
+        batch2_g = round(req_g * 0.65, 1)
+
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/active-order", json={"order_id": order_id})
+
+        # Mẻ 1 (40% định lượng) -> tự chuyển PARTIAL, chưa COMPLETED
+        client.post("/api/station/simulate/weight", json={"weight_gram": batch1_g})
+        r_b1 = client.post("/api/station/inspect", json={"override_label": "Fish", "override_quality": "FRESH"})
+        assert r_b1.status_code == 200
+        ord_mid = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        fish_mid = next(i for i in ord_mid["items"] if i["id"] == fish_item["id"])
+        assert fish_mid["status"] == "PARTIAL"
+        assert abs(fish_mid["actual_gram"] - batch1_g) < 0.2
+        log_b1 = fish_mid["log_id"]
+
+        # Nhấc rổ 1 về IDLE rồi đặt rổ 2 (65% định lượng) -> tổng 105% -> COMPLETED (Tích xanh)
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/simulate/weight", json={"weight_gram": batch2_g})
+        r_b2 = client.post("/api/station/inspect", json={"override_label": "Fish", "override_quality": "FRESH"})
+        assert r_b2.status_code == 200
+        ord_done = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        fish_done = next(i for i in ord_done["items"] if i["id"] == fish_item["id"])
+        assert fish_done["status"] == "COMPLETED"
+        assert abs(fish_done["actual_gram"] - (batch1_g + batch2_g)) < 0.2
+        log_b2 = fish_done["log_id"]
+
+        # 4. Kiểm tra đồng bộ xóa log trừ ngược daily_nutrition_analytics & phân quyền ADMIN
+        assert client.delete(f"/api/logs/{log_b2}", headers=recv_hdr).status_code == 403
+        before_kpi = get_summary_kpis(days=7)["today"]
+        assert client.delete(f"/api/logs/{log_b2}", headers=admin_hdr).status_code == 200
+        after_kpi = get_summary_kpis(days=7)["today"]
+        assert after_kpi["total_batches"] == max(0, before_kpi["total_batches"] - 1)
+        assert after_kpi["total_kcal"] <= before_kpi["total_kcal"]
+
+        # Xóa log mẻ 1 & kiểm tra _cleanup_old_captures(max_files=2)
+        client.delete(f"/api/logs/{log_b1}", headers=admin_hdr)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_cap = Path(tmpdir)
+            for idx in range(5):
+                f = tmp_cap / f"inspect_20261125_10000{idx}.jpg"
+                f.write_bytes(b"jpg")
+            orig_cap = cfg_mod.settings.capture_dir
+            object.__setattr__(cfg_mod.settings, "capture_dir", tmp_cap)
+            try:
+                removed = station_service._cleanup_old_captures(max_files=2)
+                assert removed == 3
+                assert len(list(tmp_cap.glob("inspect_*.jpg"))) == 2
+            finally:
+                object.__setattr__(cfg_mod.settings, "capture_dir", orig_cap)

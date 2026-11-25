@@ -717,10 +717,15 @@ def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
         ).fetchall()
     ]
     log_rows = conn.execute(
-        "SELECT id, weight_gram, energy_kcal, total_price_vnd FROM intake_logs WHERE order_id = ?",
+        "SELECT id, order_item_id, weight_gram, energy_kcal, total_price_vnd FROM intake_logs WHERE order_id = ?",
         (order_row["id"],),
     ).fetchall()
     log_map = {r["id"]: dict(r) for r in log_rows}
+    logs_by_item: dict[str, list[dict[str, Any]]] = {}
+    for r in log_rows:
+        item_key = r["order_item_id"] or ""
+        if item_key:
+            logs_by_item.setdefault(item_key, []).append(dict(r))
 
     total_items = len(items)
     completed_items = sum(1 for it in items if it["status"] == "COMPLETED")
@@ -729,16 +734,21 @@ def _hydrate_order(conn: Any, order_row: Any) -> dict[str, Any]:
     actual_total_kcal = 0.0
 
     for it in items:
-        if it["status"] != "COMPLETED":
+        if it["status"] not in {"COMPLETED", "PARTIAL"}:
             continue
         gram = float(it.get("actual_gram") or 0.0)
         actual_total_gram += gram
-        log_doc = log_map.get(it.get("log_id") or "")
-        if log_doc:
-            actual_total_cost_vnd += int(log_doc.get("total_price_vnd") or 0)
-            actual_total_kcal += float(log_doc.get("energy_kcal") or 0.0)
+        item_logs = logs_by_item.get(it["id"], [])
+        if item_logs:
+            actual_total_cost_vnd += sum(int(l.get("total_price_vnd") or 0) for l in item_logs)
+            actual_total_kcal += sum(float(l.get("energy_kcal") or 0.0) for l in item_logs)
         else:
-            actual_total_cost_vnd += int(round((gram / 1000.0) * int(it.get("unit_price_per_kg") or 40000)))
+            log_doc = log_map.get(it.get("log_id") or "")
+            if log_doc:
+                actual_total_cost_vnd += int(log_doc.get("total_price_vnd") or 0)
+                actual_total_kcal += float(log_doc.get("energy_kcal") or 0.0)
+            else:
+                actual_total_cost_vnd += int(round((gram / 1000.0) * int(it.get("unit_price_per_kg") or 40000)))
 
     return {
         "id": order_row["id"],
@@ -915,8 +925,9 @@ def mark_procurement_item_completed(
     log_id: str,
     image_url: str | None = None,
     accumulate: bool = False,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
-    """Đánh dấu TÍCH XANH nguyên liệu trong phiếu: chỉ ghi đè khi chưa COMPLETED, chỉ cộng dồn khi accumulate=True và đã COMPLETED."""
+    """Đánh dấu tiến độ nguyên liệu trong phiếu: cộng dồn khi PARTIAL (hoặc COMPLETED + accumulate=True), tự chuyển COMPLETED khi đạt >= min_acceptable_gram."""
     now = utc_now_iso()
     with get_db_conn() as conn:
         item_row = conn.execute(
@@ -927,24 +938,30 @@ def mark_procurement_item_completed(
             raise ValueError("Không tìm thấy dòng nguyên liệu trong phiếu yêu cầu.")
 
         grams_rounded = round(float(actual_gram), 1)
-        is_checked = item_row["status"] == "COMPLETED"
-        if accumulate and is_checked:
+        cur_status = str(item_row["status"] or "PENDING").upper()
+        if cur_status == "PARTIAL" or (accumulate and cur_status == "COMPLETED"):
             new_actual_gram = round(float(item_row["actual_gram"] or 0.0) + grams_rounded, 1)
         else:
-            # Nếu nguyên liệu chưa hoàn thành (is_checked == False), lấy đúng trọng lượng hiện tại, không cộng dồn nhầm
+            # Nếu nguyên liệu đang PENDING (chưa có mẻ thực tế nào), lấy đúng trọng lượng hiện tại, không cộng dồn nhầm
             new_actual_gram = grams_rounded
+
+        min_acc = float(item_row["min_acceptable_gram"] or 0.0)
+        if allow_partial and new_actual_gram < min_acc:
+            new_status = "PARTIAL"
+        else:
+            new_status = "COMPLETED"
 
         conn.execute(
             """
             UPDATE procurement_items
             SET actual_gram = ?, quality_status = ?, confidence = ?,
-                status = 'COMPLETED', checked_by = ?, checked_at = ?,
+                status = ?, checked_by = ?, checked_at = ?,
                 log_id = ?, image_url = ?
             WHERE id = ?
             """,
             (
                 new_actual_gram, quality_status, round(confidence, 3),
-                checked_by, now, log_id, image_url or "", item_id,
+                new_status, checked_by, now, log_id, image_url or "", item_id,
             ),
         )
 
@@ -961,7 +978,7 @@ def mark_procurement_item_completed(
             )
         else:
             conn.execute(
-                "UPDATE procurement_orders SET status = 'IN_PROGRESS' WHERE id = ? AND status = 'PENDING'",
+                "UPDATE procurement_orders SET status = 'IN_PROGRESS', completed_at = NULL WHERE id = ? AND status IN ('PENDING', 'IN_PROGRESS', 'COMPLETED')",
                 (order_id,),
             )
 
@@ -1252,9 +1269,55 @@ def list_intake_logs(
 
 
 def delete_intake_log(log_id: str) -> bool:
+    """Xóa bản ghi nhập kho và trừ ngược tương ứng vào bảng daily_nutrition_analytics."""
     with get_db_conn() as conn:
+        row = conn.execute("SELECT * FROM intake_logs WHERE id = ?", (log_id,)).fetchone()
+        if not row:
+            return False
+
         cur = conn.execute("DELETE FROM intake_logs WHERE id = ?", (log_id,))
-        return cur.rowcount > 0
+        if cur.rowcount <= 0:
+            return False
+
+        local_date = row["local_date"]
+        q_status = str(row["quality_status"] or "").upper()
+        is_accepted = q_status != "REJECTED"
+
+        w_kg = round(float(row["weight_gram"] or 0.0) / 1000.0, 4)
+        acc_kg = w_kg if is_accepted else 0.0
+        sub_kcal = float(row["energy_kcal"] or 0.0) if is_accepted else 0.0
+        sub_p = float(row["protein_g"] or 0.0) if is_accepted else 0.0
+        sub_f = float(row["fat_g"] or 0.0) if is_accepted else 0.0
+        sub_c = float(row["carbohydrate_g"] or 0.0) if is_accepted else 0.0
+        sub_fib = float(row["fiber_g"] or 0.0) if is_accepted else 0.0
+
+        fresh_dec = 1 if q_status == "FRESH" else 0
+        warn_dec = 1 if q_status == "WARNING" else 0
+        rej_dec = 1 if q_status == "REJECTED" else 0
+
+        conn.execute(
+            """
+            UPDATE daily_nutrition_analytics
+            SET total_batches = MAX(0, total_batches - 1),
+                fresh_count = MAX(0, fresh_count - ?),
+                warning_count = MAX(0, warning_count - ?),
+                rejected_count = MAX(0, rejected_count - ?),
+                total_weight_kg = MAX(0.0, ROUND(total_weight_kg - ?, 3)),
+                accepted_weight_kg = MAX(0.0, ROUND(accepted_weight_kg - ?, 3)),
+                total_kcal = MAX(0.0, ROUND(total_kcal - ?, 1)),
+                total_protein_g = MAX(0.0, ROUND(total_protein_g - ?, 1)),
+                total_fat_g = MAX(0.0, ROUND(total_fat_g - ?, 1)),
+                total_carb_g = MAX(0.0, ROUND(total_carb_g - ?, 1)),
+                total_fiber_g = MAX(0.0, ROUND(total_fiber_g - ?, 1))
+            WHERE date = ?
+            """,
+            (
+                fresh_dec, warn_dec, rej_dec,
+                w_kg, acc_kg, sub_kcal, sub_p, sub_f, sub_c, sub_fib,
+                local_date,
+            ),
+        )
+        return True
 
 
 def get_daily_analytics(days: int = 14) -> list[dict[str, Any]]:

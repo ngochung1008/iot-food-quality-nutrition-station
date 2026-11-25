@@ -1,6 +1,6 @@
 /**
- * Thẻ Đồng hồ trọng lượng real-time (48-56px tabular-nums) kết hợp
- * Quy trình 4 bước dạng Danh Sách Dọc có Ô Tích Tròn chuyển xanh mượt mà.
+ * Thẻ Đồng hồ trọng lượng real-time (POS Kiosk Touch-Ready) kết hợp
+ * Thanh trạng thái trực quan + Quy trình 4 bước dạng Danh Sách Dọc có Ô Tích Tròn chuyển xanh.
  */
 export function renderWeightGauge(container) {
   container.innerHTML = `
@@ -12,8 +12,13 @@ export function renderWeightGauge(container) {
         </span>
       </div>
 
+      <div id="wg-state-bar" class="pos-state-bar is-idle">
+        <span class="pos-state-dot"></span>
+        <span id="wg-state-text">Chờ đặt hàng lên đĩa cân (tối thiểu 15g)</span>
+      </div>
+
       <div class="scale-stepper-grid">
-        <!-- Cột trái: Số cân lớn + Nút thao tác POS -->
+        <!-- Cột trái: Số cân lớn + Nút thao tác POS cảm ứng -->
         <div style="display:flex; flex-direction:column; gap:14px;">
           <div class="weight-panel">
             <div style="font-size:15px; font-weight:600; color:var(--text-muted); margin-bottom:6px;">
@@ -33,14 +38,17 @@ export function renderWeightGauge(container) {
           </div>
 
           <div class="scale-actions-grid">
-            <button id="btn-tare" class="btn btn-lg btn-outline" type="button">
-              Tare / Về 0g
+            <button id="btn-tare" class="btn btn-pos btn-outline" type="button">
+              Trừ bì (Tare)
             </button>
-            <button id="btn-reset-session" class="btn btn-lg btn-outline" type="button">
+            <button id="btn-rescan" class="btn btn-pos btn-primary" type="button">
+              Quét lại
+            </button>
+            <button id="btn-manual-confirm" class="btn btn-pos btn-green" type="button">
+              Chốt phiếu
+            </button>
+            <button id="btn-reset-session" class="btn btn-pos btn-outline" type="button">
               Reset phiên
-            </button>
-            <button id="btn-manual-confirm" class="btn btn-lg btn-green" type="button">
-              Xác nhận thủ công
             </button>
           </div>
 
@@ -97,6 +105,8 @@ export function updateWeightGauge(snapshot) {
   const onlineEl = document.getElementById("wg-online-badge");
   const calibEl = document.getElementById("wg-calib-badge");
   const confirmBtn = document.getElementById("btn-manual-confirm");
+  const stateBar = document.getElementById("wg-state-bar");
+  const stateText = document.getElementById("wg-state-text");
 
   if (gramsEl) gramsEl.textContent = g.toFixed(1);
   if (kgEl) kgEl.textContent = `${(g / 1000).toFixed(3)} kg`;
@@ -128,10 +138,33 @@ export function updateWeightGauge(snapshot) {
     calibEl.textContent = cal ? "Đã hiệu chuẩn" : "Chưa hiệu chuẩn";
   }
 
-  // Tính bước hoàn thành & bước đang chạy cho Vertical Stepper
+  // Tính bước hoàn thành & thanh trạng thái trực quan
   const st = snapshot.state || "IDLE";
   const insp = snapshot.current_inspection;
   const committed = Boolean(insp?.committed);
+  const qStatus = insp?.quality_status || insp?.quality?.status || "FRESH";
+
+  if (stateBar && stateText) {
+    if (st === "IDLE" && (!insp || g < 8.0)) {
+      stateBar.className = "pos-state-bar is-idle";
+      stateText.textContent = "Chờ đặt hàng lên đĩa cân (tối thiểu 15g)";
+    } else if (st === "STABILIZING") {
+      stateBar.className = "pos-state-bar is-stabilizing";
+      stateText.textContent = `Đang ổn định cân... (${g.toFixed(1)}g)`;
+    } else if (st === "INSPECTING") {
+      stateBar.className = "pos-state-bar is-inspecting";
+      stateText.textContent = "AI đang kiểm định chất lượng & định lượng...";
+    } else if (qStatus === "REJECTED") {
+      stateBar.className = "pos-state-bar is-rejected";
+      stateText.textContent = `Từ chối nhập kho: ${insp?.food_name_vi || insp?.detected_class || "Hàng hư hỏng"}`;
+    } else if (qStatus === "WARNING") {
+      stateBar.className = "pos-state-bar is-warning";
+      stateText.textContent = `Cảnh báo: ${insp?.food_name_vi || insp?.detected_class || "Cần kiểm tra lại"}`;
+    } else {
+      stateBar.className = "pos-state-bar is-fresh";
+      stateText.textContent = `Đạt chuẩn: ${insp?.food_name_vi || insp?.detected_class || "Thực phẩm tươi"} (${g.toFixed(1)}g)`;
+    }
+  }
 
   let completedUpTo = 0;
   let activeStep = 1;
@@ -159,10 +192,10 @@ export function updateWeightGauge(snapshot) {
   if (confirmBtn) {
     const activeInsp = st === "IDLE" && g < 8.0 ? null : insp;
     if (activeInsp && committed) {
-      confirmBtn.textContent = "Đã lưu phiếu lô này";
+      confirmBtn.textContent = "Đã chốt phiếu lô này";
       confirmBtn.disabled = true;
     } else {
-      confirmBtn.textContent = "Xác nhận thủ công";
+      confirmBtn.textContent = "Chốt phiếu";
       confirmBtn.disabled = g < 1.0 && !activeInsp;
     }
   }
