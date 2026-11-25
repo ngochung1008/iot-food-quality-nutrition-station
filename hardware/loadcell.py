@@ -271,6 +271,7 @@ class LoadcellManager:
             if timeout > 0.3:
                 self._consecutive_timeouts = getattr(self, "_consecutive_timeouts", 0) + 1
                 if self._consecutive_timeouts >= 3:
+                    self.last_error = "HX711 không phản hồi (Timeout DOUT > 0.3s)."
                     self._consecutive_timeouts = 0
                     self._reset_hx711()
                 raise TimeoutError("HX711 không phản hồi (Timeout DOUT > 0.3s).")
@@ -629,6 +630,7 @@ class LoadcellManager:
                         self.last_grams = round(abs(smooth_g), 1)
                         self._track_auto_zero_drift(raw_adc, unclamped_g, now)
                         self._update_stability(self.last_grams, now)
+                        self._consecutive_timeouts = 0
                         self.last_error = None
                         self.scale_online = True
                         self.is_online = True
@@ -638,10 +640,19 @@ class LoadcellManager:
                         self.is_online = False
                         self.is_stable = False
                     time.sleep(0.25)
+            except TimeoutError:
+                now = time.time()
+                with self._lock:
+                    if now - self.last_sample_time > 2.0:
+                        self.scale_online = False
+                        self.is_online = False
+                        self.is_stable = False
+                time.sleep(0.05)
             except Exception as exc:
                 now = time.time()
                 with self._lock:
-                    self.last_error = f"Lỗi đọc HX711: {exc}"
+                    if getattr(self, "_consecutive_timeouts", 0) >= 3 or "Timeout DOUT" not in str(exc):
+                        self.last_error = f"Lỗi đọc HX711: {exc}"
                     if now - self.last_sample_time > 2.0:
                         self.scale_online = False
                         self.is_online = False
