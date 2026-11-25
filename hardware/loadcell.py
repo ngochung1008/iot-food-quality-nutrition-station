@@ -67,6 +67,7 @@ class LoadcellManager:
         self.current_weight: float = 0.0
         self.is_stable: bool = False
         self.scale_online: bool = False
+        self.is_online: bool = False
         self.hardware_available: bool = False
         self.last_sample_time: float = 0.0
         self.last_raw_timestamp: float = 0.0
@@ -97,6 +98,7 @@ class LoadcellManager:
         if self.mock_mode:
             self.hardware_available = False
             self.scale_online = True
+            self.is_online = True
             self.last_sample_time = time.time()
             logger.info("[LOADCELL] Khởi động ở chế độ MOCK_HARDWARE=True (Windows/Dev).")
         else:
@@ -619,8 +621,6 @@ class LoadcellManager:
                         self._raw_seq += 1
                         self.last_raw_timestamp = now
                         self.last_sample_time = now
-                        self.scale_online = True
-                        self.last_error = None
                         self._raw_cond.notify_all()
 
                         unclamped_g = self._raw_to_unclamped_grams(raw_adc)
@@ -629,9 +629,13 @@ class LoadcellManager:
                         self.last_grams = round(abs(smooth_g), 1)
                         self._track_auto_zero_drift(raw_adc, unclamped_g, now)
                         self._update_stability(self.last_grams, now)
+                        self.last_error = None
+                        self.scale_online = True
+                        self.is_online = True
                 else:
                     with self._lock:
                         self.scale_online = False
+                        self.is_online = False
                         self.is_stable = False
                     time.sleep(0.25)
             except Exception as exc:
@@ -640,6 +644,7 @@ class LoadcellManager:
                     self.last_error = f"Lỗi đọc HX711: {exc}"
                     if now - self.last_sample_time > 2.0:
                         self.scale_online = False
+                        self.is_online = False
                         self.is_stable = False
                 time.sleep(0.05)
 
@@ -752,7 +757,7 @@ class LoadcellManager:
         """Trả về trạng thái chi tiết phục vụ trang Hardware Diagnostics."""
         with self._lock:
             grams = self.last_grams
-            online = self.scale_online
+            online = self.scale_online or getattr(self, "is_online", False)
             stable = self.is_stable
             calibrated = self.calibrated
             ratio = self.scale_ratio
