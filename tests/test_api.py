@@ -1205,13 +1205,23 @@ def test_commercial_quality_guards_and_excel_export():
         def predict(self, frame, w=0.0, expected_classes=None):
             return {"detected_class": "Egg", "confidence": 0.95, "detections": []}
 
+    class _DummyLCD:
+        calls = []
+
+        def display_station_status(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
     sw_scale = _SwapScale()
     sw_cam = _DummyCam()
-    sm = NutritionStationStateMachine(scale=sw_scale, camera=sw_cam, detector=_DummyDet(), lcd=None)
+    sw_lcd = _DummyLCD()
+    sm = NutritionStationStateMachine(scale=sw_scale, camera=sw_cam, detector=_DummyDet(), lcd=sw_lcd)
+    assert sm._last_lcd_state is None
+    assert sm._last_lcd_batch is None
     assert sm.update() == StationState.STABILIZING.value
     sw_scale.is_stable = True
     assert sm.update() == StationState.CHECKOUT.value
     assert sm.current_inspection is not None
+    assert len(sw_lcd.calls) >= 1
 
     # Giữ >= 8g nhưng đổi vật khác nặng 120g (chênh > 5g) -> buộc quay lại STABILIZING & xóa kết quả AI cũ
     sw_scale.current_weight = 120.0

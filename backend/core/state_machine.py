@@ -47,14 +47,14 @@ class NutritionStationStateMachine:
         self._active_batch_class: str | None = None
         self._active_batch_weight_g: float = 0.0
         self._below_idle_count: int = 0
+        self._last_lcd_state: str | None = None
+        self._last_lcd_weight: float = -999.0
+        self._last_lcd_update_ts: float = 0.0
+        self._last_lcd_batch: str | None = None
 
     @property
     def _batch_accumulated_in_current_load(self) -> bool:
         return self._current_load_committed
-        self._last_lcd_state: str = ""
-        self._last_lcd_weight: float = -999.0
-        self._last_lcd_update_ts: float = 0.0
-        self._last_lcd_batch: str = ""
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         try:
@@ -124,6 +124,10 @@ class NutritionStationStateMachine:
             self._active_batch_class = None
             self._active_batch_weight_g = 0.0
             self._below_idle_count = 0
+            self._last_lcd_state = None
+            self._last_lcd_batch = None
+            self._last_lcd_weight = -999.0
+            self._last_lcd_update_ts = 0.0
             self.scale.station_state = self.state.value
             if hasattr(self.scale, "reset_stability"):
                 self.scale.reset_stability()
