@@ -817,11 +817,12 @@ def _pack_prediction(
 
         if final_score >= conf_threshold or raw_conf >= conf_threshold:
             label = str(selected["label"])
-            confidence = round(min(0.99, max(raw_conf, final_score)), 3)
+            confidence = round(raw_conf, 3)
             quality_status = evaluate_quality(label, confidence)
             primary["label"] = label
             primary["confidence"] = confidence
             primary["raw_confidence"] = raw_conf
+            primary["reranked_score"] = round(final_score, 3)
             primary["class_id"] = selected.get("class_id", primary.get("class_id", -1))
             primary["top_candidates"] = top_candidates
             final_detections = [primary] + [
@@ -830,12 +831,13 @@ def _pack_prediction(
             best = primary
         elif 0.22 <= final_score < conf_threshold and is_expected:
             label = str(selected["label"])
-            confidence = round(final_score, 3)
+            confidence = round(raw_conf, 3)
             quality_status = QualityStatus.WARNING.value
             quality_note = "Cần kiểm tra cảm quan (Độ tự tin AI trung bình)"
             primary["label"] = label
             primary["confidence"] = confidence
             primary["raw_confidence"] = raw_conf
+            primary["reranked_score"] = round(final_score, 3)
             primary["class_id"] = selected.get("class_id", primary.get("class_id", -1))
             primary["top_candidates"] = top_candidates
             final_detections = [primary] + [

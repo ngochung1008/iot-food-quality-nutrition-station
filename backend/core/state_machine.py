@@ -40,13 +40,17 @@ class NutritionStationStateMachine:
         self.current_inspection: dict[str, Any] | None = None
         self.last_committed_receipt: dict[str, Any] | None = None
         self._session_committed: bool = False
-        self._batch_accumulated_in_current_load: bool = False
-        self._active_batch_log_id: str | None = None
+        self._current_load_committed: bool = False
+        self._current_load_log_id: str | None = None
         self._active_batch_order_id: str | None = None
         self._active_batch_item_id: str | None = None
         self._active_batch_class: str | None = None
         self._active_batch_weight_g: float = 0.0
         self._below_idle_count: int = 0
+
+    @property
+    def _batch_accumulated_in_current_load(self) -> bool:
+        return self._current_load_committed
         self._last_lcd_state: str = ""
         self._last_lcd_weight: float = -999.0
         self._last_lcd_update_ts: float = 0.0
@@ -113,8 +117,8 @@ class NutritionStationStateMachine:
             self.state = StationState.IDLE
             self.current_inspection = None
             self._session_committed = False
-            self._batch_accumulated_in_current_load = False
-            self._active_batch_log_id = None
+            self._current_load_committed = False
+            self._current_load_log_id = None
             self._active_batch_order_id = None
             self._active_batch_item_id = None
             self._active_batch_class = None
@@ -143,8 +147,8 @@ class NutritionStationStateMachine:
         self.state = StationState.IDLE
         self.current_inspection = None
         self._session_committed = False
-        self._batch_accumulated_in_current_load = False
-        self._active_batch_log_id = None
+        self._current_load_committed = False
+        self._current_load_log_id = None
         self._active_batch_order_id = None
         self._active_batch_item_id = None
         self._active_batch_class = None
@@ -402,6 +406,7 @@ class NutritionStationStateMachine:
             "quality": quality,
             "nutrition": nutrition,
             "committed": False,
+            "batch_adjusted": False,
             "manual_empty": bool(weight_gram is None and w < settings.idle_weight_g),
         }
 
@@ -412,8 +417,8 @@ class NutritionStationStateMachine:
                 self.state = StationState.CHECKOUT
             target_order_id = self.active_order_id
             already_committed_in_session = self._session_committed
-            batch_accumulated = self._batch_accumulated_in_current_load
-            active_batch_log_id = self._active_batch_log_id
+            batch_accumulated = self._current_load_committed
+            active_batch_log_id = self._current_load_log_id
             active_batch_order_id = self._active_batch_order_id
             active_batch_item_id = self._active_batch_item_id
             active_batch_class = self._active_batch_class
@@ -462,12 +467,14 @@ class NutritionStationStateMachine:
                                 delta_gram=delta_gram,
                                 inspection=inspection_result,
                             )
+                            inspection_result["batch_adjusted"] = True
                             with self._lock:
                                 self._active_batch_weight_g = round(w, 1)
                         except Exception as exc:
                             logger.warning(f"[STATE] Lỗi điều chỉnh delta_gram mẻ hiện tại: {exc}")
                     else:
                         inspection_result["committed"] = True
+                        inspection_result["batch_adjusted"] = True
                 auto_checked = True
             elif (not already_committed_in_session) or (override_label is not None and (not batch_accumulated or not same_active_class)):
                 if order and order.get("status") in {"PENDING", "IN_PROGRESS"}:
@@ -497,8 +504,8 @@ class NutritionStationStateMachine:
                             auto_checked = True
                             with self._lock:
                                 self._session_committed = True
-                                self._batch_accumulated_in_current_load = True
-                                self._active_batch_log_id = (commit_res.get("receipt") or {}).get("id")
+                                self._current_load_committed = True
+                                self._current_load_log_id = (commit_res.get("receipt") or {}).get("id")
                                 self._active_batch_order_id = target_order_id
                                 self._active_batch_item_id = matched_item["id"]
                                 self._active_batch_class = nutrition["class_name"]
@@ -509,10 +516,11 @@ class NutritionStationStateMachine:
         if (not batch_accumulated) and (not already_committed_in_session) and not auto_checked and self.auto_commit and w >= settings.idle_weight_g and quality.get("status") == "FRESH":
             from backend.services.station_service import station_service
 
-            station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định", accumulate=False)
+            commit_res = station_service.commit_current_inspection(note="Tự động lưu khi cân ổn định", accumulate=False)
             with self._lock:
                 self._session_committed = True
-                self._batch_accumulated_in_current_load = True
+                self._current_load_committed = True
+                self._current_load_log_id = (commit_res.get("receipt") or {}).get("id")
 
         self._emit("inspection_result", self.snapshot())
         return inspection_result

@@ -894,6 +894,9 @@ def test_context_and_weight_aware_reranking():
     )
     assert packed["detected_class"] == "Egg"
     assert packed["reranked"] is True
+    # Điểm hiển thị phải giữ nguyên raw_confidence gốc (0.28), KHÔNG thổi phồng lên 0.99
+    assert packed["confidence"] == 0.28
+    assert packed["confidence_percent"] == 28.0
 
     # 2b. Kiểm tra khoảng 0.22..0.35 khớp expected_classes -> trả về WARNING kèm ghi chú thay vì Unknown
     low_cands = [{"class_id": 24, "label": "Egg", "confidence": 0.16}]
@@ -981,7 +984,7 @@ def test_context_and_weight_aware_reranking():
                             "box": {"x1": 100, "y1": 80, "x2": 400, "y2": 360},
                             "top_candidates": [
                                 {"class_id": chicken_id, "label": "Chicken", "confidence": 0.76},
-                                {"class_id": egg_id, "label": "Egg", "confidence": 0.28},
+                                {"class_id": egg_id, "label": "Egg", "confidence": 0.72},
                             ],
                         }
                     ],
@@ -1004,6 +1007,8 @@ def test_context_and_weight_aware_reranking():
             insp = r_insp.json()["inspection"]
             assert insp["detected_class"] == "Egg"
             assert insp["reranked"] is True
+            assert insp["confidence"] == 0.72
+            assert insp["confidence_percent"] == 72.0
 
             ord_after = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
             egg_after = next(i for i in ord_after["items"] if i["id"] == egg_item["id"])
@@ -1401,10 +1406,17 @@ def test_no_duplicate_accumulation_until_scale_returns_to_idle():
         assert pork_1["actual_gram"] == 200.0
         log1_id = pork_1["log_id"]
 
-        # 3. KHÔNG nhấc vật ra: trọng lượng dao động sang 203g & quét lại -> chỉ điều chỉnh thành 203.0g (KHÔNG thành 403.0g)
+        # 3. KHÔNG nhấc vật ra: ấn /api/station/inspect nhiều lần & dao động sang 203g -> chỉ điều chỉnh thành 203.0g (KHÔNG thành 403.0g)
+        r_repeat = client.post("/api/station/inspect", json={"override_label": "Pork", "override_quality": "FRESH"})
+        assert r_repeat.status_code == 200
+        assert r_repeat.json()["inspection"]["batch_adjusted"] is True
+        ord_repeat = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        assert next(i for i in ord_repeat["items"] if i["id"] == pork_item_id)["actual_gram"] == 200.0
+
         client.post("/api/station/simulate/weight", json={"weight_gram": 203.0})
         r2 = client.post("/api/station/inspect", json={"override_label": "Pork", "override_quality": "FRESH"})
         assert r2.status_code == 200
+        assert r2.json()["inspection"]["batch_adjusted"] is True
         ord_2 = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
         pork_2 = next(i for i in ord_2["items"] if i["id"] == pork_item_id)
         assert pork_2["actual_gram"] == 203.0

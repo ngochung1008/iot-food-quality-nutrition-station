@@ -485,6 +485,13 @@ export class LiveStationPage {
     const pendingMatch = order.items.find((it) => it.status === "PENDING" && it.class_name.toLowerCase() === cls);
     const completedMatch = order.items.find((it) => it.status === "COMPLETED" && it.class_name.toLowerCase() === cls);
 
+    if (insp.batch_adjusted) {
+      playSuccessBeep();
+      const wVal = Number(insp.weight_g ?? insp.weight_gram ?? 0).toFixed(1);
+      this.toast(`Đã cập nhật lại mẻ đang cân: ${wVal}g`, "info");
+      return;
+    }
+
     if (insp.committed && completedMatch) {
       playSuccessBeep();
       this.toast(`Đã đối chiếu đủ và tích xanh: ${completedMatch.food_name_vi}`, "success");
