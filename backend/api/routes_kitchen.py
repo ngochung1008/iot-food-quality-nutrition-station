@@ -16,6 +16,7 @@ from backend.database.crud import (
     create_dish,
     create_procurement_order,
     delete_dish,
+    delete_procurement_order,
     get_procurement_order,
     list_dishes,
     list_procurement_orders,
@@ -126,6 +127,18 @@ def create_order(body: CreateOrderRequest, user: dict = Depends(get_current_user
         return order
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/orders/{order_id}", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF))])
+def remove_order(order_id: str):
+    """Xóa Phiếu Yêu Cầu Nguyên Liệu (chỉ ADMIN/CHEF) và gỡ active_order_id nếu đang chọn phiếu này."""
+    if not delete_procurement_order(order_id):
+        raise HTTPException(status_code=404, detail="Không tìm thấy phiếu yêu cầu.")
+    if station_service.state_machine and station_service.state_machine.active_order_id == order_id:
+        station_service.state_machine.set_active_order(None)
+        station_service._on_station_event("state_change", station_service.state_machine.snapshot())
+    station_service._on_station_event("order_deleted", {"order_id": order_id})
+    return {"ok": True, "deleted_id": order_id}
 
 
 @router.post("/orders/{order_id}/check-item", dependencies=[Depends(require_roles(ROLE_ADMIN, ROLE_CHEF, ROLE_RECEIVER))])

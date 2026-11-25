@@ -166,8 +166,8 @@ async function enterAuthenticatedShell() {
   wsClient = new StationWebSocketClient(
     (msg) => {
       if (!msg?.data) return;
-      if (msg.event === "order_created" || msg.event === "order_updated") {
-        pages[activePageKey]?.onOrderEvent?.(msg.data.order);
+      if (msg.event === "order_created" || msg.event === "order_updated" || msg.event === "order_deleted") {
+        pages[activePageKey]?.onOrderEvent?.(msg.data?.order || null);
         return;
       }
       if (msg.event === "receipt_committed") {

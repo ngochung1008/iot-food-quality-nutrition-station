@@ -3,7 +3,7 @@
  * - Lập kế hoạch bữa ăn (Chọn món + Số lượng suất ăn) -> Tính tổng Calo/Macro -> Đẩy Phiếu Yêu Cầu Nguyên Liệu.
  * - Quản lý & tạo mới Món ăn chuẩn chỉ sử dụng 64 nguyên liệu từ YOLO26n dataset.
  */
-import { apiClient } from "../services/apiClient.js";
+import { apiClient, getAuthSession } from "../services/apiClient.js";
 
 export class ChefMenuPage {
   constructor(toast) {
@@ -203,17 +203,26 @@ export class ChefMenuPage {
   _renderDishPicker() {
     const picker = document.getElementById("chef-dish-picker");
     if (!picker) return;
+    const { user } = getAuthSession();
+    const canManage = Boolean(user && (user.role === "ADMIN" || user.role === "CHEF"));
+
     picker.innerHTML = this.dishes
       .map((d) => {
         const checked = this.selectedDishIds.has(d.id) ? "checked" : "";
         const ingText = d.ingredients.map((i) => `${i.vietnamese_name} (${i.grams_per_serving}g)`).join(", ");
+        const delDishBtn = canManage
+          ? `<button type="button" class="btn btn-sm btn-outline btn-del-dish" data-dish-id="${d.id}" data-dish-name="${d.name_vi}" style="min-height:30px; padding:2px 8px; color:var(--danger); border-color:#FCA5A5;">Xóa</button>`
+          : "";
         return `
           <label style="display:flex; align-items:flex-start; gap:10px; padding:8px 10px; border-radius:6px; border:1px solid var(--border-light); cursor:pointer; background:${checked ? "var(--bg-green-soft)" : "#fff"};">
             <input type="checkbox" class="dish-chk" value="${d.id}" ${checked} style="margin-top:3px; width:18px; height:18px;" />
-            <div style="flex:1;">
-              <div style="display:flex; justify-content:space-between; gap:8px;">
+            <div style="flex:1; min-width:0;">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
                 <strong style="font-size:16px;">${d.name_vi}</strong>
-                <span class="badge badge-neutral">${d.per_serving.energy_kcal} kcal/suất</span>
+                <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
+                  <span class="badge badge-neutral">${d.per_serving.energy_kcal} kcal/suất</span>
+                  ${delDishBtn}
+                </div>
               </div>
               <div style="font-size:14px; color:var(--text-muted); margin-top:2px;">${ingText}</div>
             </div>
@@ -229,6 +238,24 @@ export class ChefMenuPage {
         else this.selectedDishIds.delete(id);
         this._renderDishPicker();
         this._recalcMealPlan();
+      });
+    });
+
+    picker.querySelectorAll(".btn-del-dish").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const dishId = Number(btn.dataset.dishId);
+        const dishName = btn.dataset.dishName || `#${dishId}`;
+        if (!window.confirm(`Xác nhận xóa món ăn chuẩn "${dishName}" khỏi thực đơn?`)) return;
+        try {
+          await apiClient.deleteDish(dishId);
+          this.selectedDishIds.delete(dishId);
+          this.toast(`Đã xóa món "${dishName}".`, "success");
+          await this.loadData();
+        } catch (err) {
+          this.toast(err.message, "error");
+        }
       });
     });
   }
@@ -306,6 +333,9 @@ export class ChefMenuPage {
       tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--text-muted);">Chưa có phiếu yêu cầu nào.</td></tr>`;
       return;
     }
+    const { user } = getAuthSession();
+    const canManage = Boolean(user && (user.role === "ADMIN" || user.role === "CHEF"));
+
     tbody.innerHTML = this.orders
       .map((o) => {
         const stBadge =
@@ -314,6 +344,9 @@ export class ChefMenuPage {
             : o.status === "IN_PROGRESS"
             ? `<span class="badge badge-warning">ĐANG CÂN ĐỐI CHIẾU</span>`
             : `<span class="badge badge-info">CHỜ TIẾP NHẬN</span>`;
+        const delBtn = canManage
+          ? `<button type="button" class="btn btn-sm btn-danger btn-del-order" data-order-id="${o.id}" data-order-code="${o.order_code}" style="min-height:32px; padding:4px 10px;">Xóa</button>`
+          : "";
         return `
           <tr>
             <td class="tabular-nums"><strong>${o.order_code}</strong></td>
@@ -324,11 +357,31 @@ export class ChefMenuPage {
               <div style="font-size:14px; font-weight:700;">${o.progress.completed} / ${o.progress.total} nguyên liệu (${o.progress.percent}%)</div>
               <div class="progress-track" style="width:140px;"><div class="progress-fill" style="width:${o.progress.percent}%;"></div></div>
             </td>
-            <td>${stBadge}</td>
+            <td>
+              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                ${stBadge}
+                ${delBtn}
+              </div>
+            </td>
           </tr>
         `;
       })
       .join("");
+
+    tbody.querySelectorAll(".btn-del-order").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const orderId = btn.dataset.orderId;
+        const orderCode = btn.dataset.orderCode || orderId;
+        if (!window.confirm(`Xác nhận xóa phiếu yêu cầu nguyên liệu "${orderCode}"?`)) return;
+        try {
+          await apiClient.deleteOrder(orderId);
+          this.toast(`Đã xóa phiếu ${orderCode}.`, "success");
+          await this.loadData();
+        } catch (err) {
+          this.toast(err.message, "error");
+        }
+      });
+    });
   }
 
   _renderIngredientRows() {

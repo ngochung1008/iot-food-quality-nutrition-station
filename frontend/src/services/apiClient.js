@@ -110,6 +110,8 @@ export const apiClient = {
   getOrderDetail: (orderId) => request(`/api/kitchen/orders/${orderId}`),
   createOrder: (payload) =>
     request("/api/kitchen/orders", { method: "POST", body: JSON.stringify(payload) }),
+  deleteOrder: (orderId) =>
+    request(`/api/kitchen/orders/${orderId}`, { method: "DELETE" }),
   checkOrderItem: (orderId, itemId, overrideClass = null, note = "") =>
     request(`/api/kitchen/orders/${orderId}/check-item`, {
       method: "POST",

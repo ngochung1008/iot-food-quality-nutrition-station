@@ -1014,6 +1014,20 @@ def reset_procurement_order(order_id: str) -> dict[str, Any] | None:
         return _hydrate_order(conn, updated_row)
 
 
+def delete_procurement_order(order_id: str) -> bool:
+    """Xóa Phiếu Yêu Cầu Nguyên Liệu; gỡ liên kết trên intake_logs để giữ lịch sử cân nhập kho."""
+    with get_db_conn() as conn:
+        row = conn.execute("SELECT id FROM procurement_orders WHERE id = ?", (order_id,)).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE intake_logs SET order_id = NULL, order_item_id = NULL WHERE order_id = ?",
+            (order_id,),
+        )
+        cur = conn.execute("DELETE FROM procurement_orders WHERE id = ?", (order_id,))
+        return cur.rowcount > 0
+
+
 def add_procurement_order_item(
     order_id: str,
     class_name: str,

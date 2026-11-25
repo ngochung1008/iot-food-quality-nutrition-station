@@ -1070,3 +1070,80 @@ def test_order_reset_does_not_accumulate_stale_logs_cost_or_kcal():
         if log2_id:
             client.delete(f"/api/logs/{log2_id}", headers=admin_hdr)
         client.delete(f"/api/kitchen/dishes/{dish_id}", headers=chef_hdr)
+
+
+def test_delete_procurement_order_and_dish():
+    """Kiểm tra DELETE /api/kitchen/orders/{order_id} và DELETE /api/kitchen/dishes/{dish_id} (RBAC + giữ log + bỏ active_order_id)."""
+    from backend.database.models import get_db_conn
+    from backend.services.station_service import station_service
+
+    with TestClient(app) as client:
+        admin_hdr = _login(client, "admin", "admin123")
+        chef_hdr = _login(client, "chef", "chef123")
+        recv_hdr = _login(client, "receiver", "receiver123")
+
+        # 1. Tạo món mới & phiếu mới
+        r_dish = client.post(
+            "/api/kitchen/dishes",
+            headers=chef_hdr,
+            json={
+                "name_vi": "Món test xóa (Cà chua)",
+                "category": "Món rau / Salad",
+                "ingredients": [{"class_name": "Tomato", "grams_per_serving": 100.0}],
+            },
+        )
+        assert r_dish.status_code == 200, r_dish.text
+        dish_id = r_dish.json()["id"]
+
+        r_ord = client.post(
+            "/api/kitchen/orders",
+            headers=chef_hdr,
+            json={
+                "title": "Phiếu test xóa",
+                "meal_date": "2026-11-25",
+                "meal_shift": "Bữa trưa",
+                "servings": 2,
+                "dish_ids": [dish_id],
+                "tolerance_percent": 5.0,
+            },
+        )
+        assert r_ord.status_code == 200, r_ord.text
+        order_id = r_ord.json()["id"]
+
+        # Gắn active_order_id và cân 1 mẻ để có intake_log gắn vào phiếu
+        client.post("/api/station/reset", json={"reset_order": False})
+        client.post("/api/station/active-order", json={"order_id": order_id})
+        client.post("/api/station/simulate/weight", json={"weight_gram": 200.0})
+        client.post("/api/station/inspect", json={"override_label": "Tomato", "override_quality": "FRESH"})
+        ord_data = client.get(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).json()
+        log_id = ord_data["items"][0]["log_id"]
+        assert log_id
+
+        # 2. RECEIVER không được phép xóa phiếu hoặc món ăn (403)
+        assert client.delete(f"/api/kitchen/orders/{order_id}", headers=recv_hdr).status_code == 403
+        assert client.delete(f"/api/kitchen/dishes/{dish_id}", headers=recv_hdr).status_code == 403
+
+        # 3. CHEF xóa phiếu -> 200 OK, xóa order & items, active_order_id về None, log được giữ lại và gỡ order_id
+        r_del_ord = client.delete(f"/api/kitchen/orders/{order_id}", headers=chef_hdr)
+        assert r_del_ord.status_code == 200, r_del_ord.text
+        assert r_del_ord.json()["deleted_id"] == order_id
+        assert station_service.state_machine.active_order_id is None
+        assert client.get(f"/api/kitchen/orders/{order_id}", headers=chef_hdr).status_code == 404
+        assert client.delete(f"/api/kitchen/orders/{order_id}", headers=chef_hdr).status_code == 404
+
+        with get_db_conn() as conn:
+            log_row = conn.execute("SELECT id, order_id, order_item_id FROM intake_logs WHERE id = ?", (log_id,)).fetchone()
+            assert log_row is not None
+            assert log_row["order_id"] is None
+            assert log_row["order_item_id"] is None
+            items_cnt = conn.execute("SELECT COUNT(*) AS c FROM procurement_items WHERE order_id = ?", (order_id,)).fetchone()["c"]
+            assert items_cnt == 0
+
+        # 4. ADMIN/CHEF xóa món ăn -> 200 OK, không còn trong GET /api/kitchen/dishes
+        r_del_dish = client.delete(f"/api/kitchen/dishes/{dish_id}", headers=admin_hdr)
+        assert r_del_dish.status_code == 200
+        dishes_now = client.get("/api/kitchen/dishes", headers=chef_hdr).json()
+        assert all(d["id"] != dish_id for d in dishes_now)
+
+        # Dọn dẹp log test
+        client.delete(f"/api/logs/{log_id}", headers=admin_hdr)
